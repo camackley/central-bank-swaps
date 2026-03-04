@@ -56,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max listing pages to paginate per bank (default: 5)",
     )
     parser.add_argument(
+        "--classify-model",
+        default=None,
+        help="Override LLM model for classification stage (e.g. claude-haiku-3-5)",
+    )
+    parser.add_argument(
+        "--extract-model",
+        default=None,
+        help="Override LLM model for extraction stage (e.g. claude-sonnet-4-20250514)",
+    )
+    parser.add_argument(
         "--mode",
         choices=["backfill", "incremental"],
         default="backfill",
@@ -87,12 +97,24 @@ def main(argv: list[str] | None = None) -> None:
     conn = duckdb.connect(args.db)
     init_db(conn)
 
-    # Set up LLM
+    # Set up LLMs
     llm = get_llm(args.provider, args.model)
+    classify_llm = (
+        get_llm(args.provider, args.classify_model) if args.classify_model else None
+    )
+    extract_llm = (
+        get_llm(args.provider, args.extract_model) if args.extract_model else None
+    )
 
     # Wire pipeline
     with BrowserAdapter() as browser:
-        orchestrator = Orchestrator(conn=conn, llm=llm, browser=browser)
+        orchestrator = Orchestrator(
+            conn=conn,
+            llm=llm,
+            browser=browser,
+            classify_llm=classify_llm,
+            extract_llm=extract_llm,
+        )
         processor = DefaultBankProcessor(
             orchestrator=orchestrator,
             browser=browser,

@@ -42,6 +42,24 @@ class TestResumeFlag:
         assert args.resume == run_id
 
 
+class TestModelTieringFlags:
+    def test_classify_model_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--classify-model", "claude-haiku-3-5"])
+        assert args.classify_model == "claude-haiku-3-5"
+
+    def test_extract_model_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--extract-model", "claude-sonnet-4-20250514"])
+        assert args.extract_model == "claude-sonnet-4-20250514"
+
+    def test_model_flags_default_to_none(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([])
+        assert args.classify_model is None
+        assert args.extract_model is None
+
+
 class TestModuleImportable:
     def test_module_importable(self) -> None:
         import cbs.pipeline.__main__  # noqa: F401

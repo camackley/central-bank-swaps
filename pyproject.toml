@@ -30,6 +30,7 @@ dev = [
     "mypy>=1.13",
     "types-PyYAML>=6.0",
     "types-beautifulsoup4>=4.12",
+    "openpyxl>=3.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -48,6 +49,8 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not benchmark'"
 markers = [
     "integration: marks tests that may hit real services (deselect with '-m \"not integration\"')",
+    "benchmark: marks accuracy benchmark tests that hit real LLM APIs (run with '-m benchmark')",
 ]
