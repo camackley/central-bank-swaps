@@ -1,4 +1,4 @@
-"""Classification accuracy benchmarks — Slice 1.5.1.
+"""Classification accuracy benchmarks — Slices 1.5.1 & 1.5.2.
 
 These tests hit real LLM APIs and are excluded from the default pytest run.
 Run explicitly with: pytest tests/benchmarks/ -m benchmark
@@ -65,3 +65,25 @@ class TestBenchmarkRunsAcrossTwoProviders:
         assert result.tp + result.fp + result.tn + result.fn == len(dataset)
         assert result.precision >= 0.0
         assert result.recall >= 0.0
+
+
+@pytest.mark.benchmark
+class TestCheapClassifierAccuracy:
+    """Verify accuracy with a cheaper classification model (1.5.2)."""
+
+    @pytest.fixture(scope="class")
+    def cheap_result(self, dataset: list) -> object:
+        llm = get_llm("anthropic", "claude-haiku-3-5")
+        return run_classification_benchmark(llm, dataset)
+
+    def test_cheap_classifier_precision_above_90(self, cheap_result: object) -> None:
+        assert cheap_result.precision >= 0.90, (
+            f"Cheap model precision {cheap_result.precision:.2%} below 90%. "
+            f"TP={cheap_result.tp}, FP={cheap_result.fp}"
+        )
+
+    def test_cheap_classifier_recall_above_85(self, cheap_result: object) -> None:
+        assert cheap_result.recall >= 0.85, (
+            f"Cheap model recall {cheap_result.recall:.2%} below 85%. "
+            f"TP={cheap_result.tp}, FN={cheap_result.fn}"
+        )

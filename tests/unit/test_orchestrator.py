@@ -329,3 +329,98 @@ class TestPipelineHandlesPdfPressRelease:
         ).fetchone()
         assert pr is not None
         assert pr[0] == "pdf"
+
+
+# ---------------------------------------------------------------------------
+# test_per_stage_model_tiering (Slice 1.5.2)
+# ---------------------------------------------------------------------------
+
+
+class TestPerStageModelTiering:
+    """Per-stage LLMs are forwarded to the correct pipeline functions."""
+
+    @patch(f"{_PATCH_BASE}.extract_swaps", return_value=_BILATERAL_EXTRACTION)
+    @patch(f"{_PATCH_BASE}.classify_press_release", return_value=_SWAP_CLASSIFICATION)
+    @patch(f"{_PATCH_BASE}.translate_text", return_value=_TRANSLATION_EN)
+    @patch(f"{_PATCH_BASE}.detect_language", return_value="en")
+    def test_classifier_uses_classify_llm(
+        self,
+        mock_detect: MagicMock,
+        mock_translate: MagicMock,
+        mock_classify: MagicMock,
+        _mock_extract: MagicMock,
+        db: duckdb.DuckDBPyConnection,
+    ) -> None:
+        default_llm = MagicMock(name="default")
+        classify_llm = MagicMock(name="classify")
+        mock_browser = MagicMock()
+        orch = Orchestrator(
+            conn=db,
+            llm=default_llm,
+            browser=mock_browser,
+            classify_llm=classify_llm,
+        )
+
+        orch.process_press_release(_HTML_RESULT_SWAP, bank_name="Fed", country="US")
+
+        # Classifier should receive the classify LLM
+        mock_classify.assert_called_once()
+        assert mock_classify.call_args[0][0] is classify_llm
+
+        # Translate should use default LLM (no translate_llm override)
+        mock_detect.assert_called_once()
+        assert mock_detect.call_args[0][0] is default_llm
+        mock_translate.assert_called_once()
+        assert mock_translate.call_args[0][0] is default_llm
+
+    @patch(f"{_PATCH_BASE}.extract_swaps", return_value=_BILATERAL_EXTRACTION)
+    @patch(f"{_PATCH_BASE}.classify_press_release", return_value=_SWAP_CLASSIFICATION)
+    @patch(f"{_PATCH_BASE}.translate_text", return_value=_TRANSLATION_EN)
+    @patch(f"{_PATCH_BASE}.detect_language", return_value="en")
+    def test_extractor_uses_extract_llm(
+        self,
+        _mock_detect: MagicMock,
+        _mock_translate: MagicMock,
+        _mock_classify: MagicMock,
+        mock_extract: MagicMock,
+        db: duckdb.DuckDBPyConnection,
+    ) -> None:
+        default_llm = MagicMock(name="default")
+        extract_llm = MagicMock(name="extract")
+        mock_browser = MagicMock()
+        orch = Orchestrator(
+            conn=db,
+            llm=default_llm,
+            browser=mock_browser,
+            extract_llm=extract_llm,
+        )
+
+        orch.process_press_release(_HTML_RESULT_SWAP, bank_name="Fed", country="US")
+
+        # Extractor should receive the extract LLM
+        mock_extract.assert_called_once()
+        assert mock_extract.call_args[0][0] is extract_llm
+
+    @patch(f"{_PATCH_BASE}.extract_swaps", return_value=_BILATERAL_EXTRACTION)
+    @patch(f"{_PATCH_BASE}.classify_press_release", return_value=_SWAP_CLASSIFICATION)
+    @patch(f"{_PATCH_BASE}.translate_text", return_value=_TRANSLATION_EN)
+    @patch(f"{_PATCH_BASE}.detect_language", return_value="en")
+    def test_default_llm_used_when_no_overrides(
+        self,
+        mock_detect: MagicMock,
+        mock_translate: MagicMock,
+        mock_classify: MagicMock,
+        mock_extract: MagicMock,
+        db: duckdb.DuckDBPyConnection,
+    ) -> None:
+        default_llm = MagicMock(name="default")
+        mock_browser = MagicMock()
+        orch = Orchestrator(conn=db, llm=default_llm, browser=mock_browser)
+
+        orch.process_press_release(_HTML_RESULT_SWAP, bank_name="Fed", country="US")
+
+        # All stages should use the default LLM
+        assert mock_detect.call_args[0][0] is default_llm
+        assert mock_translate.call_args[0][0] is default_llm
+        assert mock_classify.call_args[0][0] is default_llm
+        assert mock_extract.call_args[0][0] is default_llm
