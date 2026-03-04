@@ -19,7 +19,7 @@ banks:
 
   - name: People's Bank of China
     country: China
-    homepage_url: http://www.pbc.gov.cn/en
+    homepage_url: https://www.pbc.gov.cn/en
     page_load_timeout: 30
 
   - name: Bank of England
