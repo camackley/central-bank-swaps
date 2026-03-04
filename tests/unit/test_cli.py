@@ -18,6 +18,19 @@ class TestDefaultArgsParse:
         assert args.model == "claude-sonnet-4-20250514"
         assert args.max_pages == 5
         assert args.resume is None
+        assert args.mode == "backfill"
+
+
+class TestModeFlag:
+    def test_incremental_mode(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--mode", "incremental"])
+        assert args.mode == "incremental"
+
+    def test_backfill_mode_explicit(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--mode", "backfill"])
+        assert args.mode == "backfill"
 
 
 class TestResumeFlag:

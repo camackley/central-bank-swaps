@@ -10,6 +10,7 @@ class BankProcessingResult(BaseModel):
 
     bank_name: str
     press_releases_found: int = 0
+    skipped_duplicates: int = 0
     swaps_extracted: int = 0
     errors: list[str] = []
     hit_cutoff: bool = False
