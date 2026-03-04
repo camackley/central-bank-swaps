@@ -2,10 +2,12 @@
 
 from cbs.scraper.browser import (
     BrowserAdapter,
+    BrowserClient,
     BrowserConnectionError,
     BrowserError,
     BrowserNavigationError,
     BrowserTimeoutError,
+    PageContent,
     PageLink,
     PageSnapshot,
 )
@@ -18,6 +20,7 @@ from cbs.scraper.navigator import NavigationError, find_press_releases
 
 __all__ = [
     "BrowserAdapter",
+    "BrowserClient",
     "BrowserConnectionError",
     "BrowserError",
     "BrowserNavigationError",
@@ -26,6 +29,7 @@ __all__ = [
     "NavigationError",
     "NavigationResult",
     "NavigationStep",
+    "PageContent",
     "PageLink",
     "PageSnapshot",
     "find_press_releases",
