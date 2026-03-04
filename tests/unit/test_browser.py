@@ -9,12 +9,15 @@ import httpx
 import pytest
 
 from cbs.scraper.browser import (
+    BrowserAdapter,
     BrowserClient,
     BrowserConnectionError,
     BrowserError,
     BrowserNavigationError,
     BrowserTimeoutError,
     PageContent,
+    PageLink,
+    PageSnapshot,
 )
 
 # ---------------------------------------------------------------------------
@@ -322,3 +325,225 @@ class TestBrowserConnectionErrors:
 
         with pytest.raises(BrowserNavigationError, match="500"):
             b.navigate(_PAGE_URL)
+
+
+# ===========================================================================
+# BrowserAdapter tests (Slice 1.13)
+# ===========================================================================
+
+_ADAPTER_SNAPSHOT = (
+    '<a ref="e0" href="https://example.com/page1">Page 1</a>'
+    '<a ref="e1" href="https://example.com/page2">Page 2</a>'
+    '<a href="https://example.com/no-ref">No Ref Link</a>'
+    '<span ref="e3">Not a link</span>'
+)
+
+_ADAPTER_SNAPSHOT_AFTER_CLICK = (
+    '<a ref="e5" href="https://example.com/clicked">Clicked Page</a>'
+)
+
+
+def _adapter_route(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """Route mock HTTP calls for BrowserAdapter tests."""
+    path = url.replace("http://localhost:9867", "")
+
+    if method == "post" and path == "/instances/start":
+        return _json_response({"id": _INSTANCE_ID})
+    if method == "post" and path == f"/instances/{_INSTANCE_ID}/tabs/open":
+        return _json_response(
+            {"tabId": _TAB_ID, "url": _PAGE_URL, "title": _PAGE_TITLE}
+        )
+    if method == "post" and path == f"/tabs/{_TAB_ID}/navigate":
+        return _json_response({})
+    if method == "get" and path == f"/tabs/{_TAB_ID}/text":
+        return _text_response(_PAGE_TEXT)
+    if method == "get" and path == f"/tabs/{_TAB_ID}/snapshot":
+        return _text_response(_ADAPTER_SNAPSHOT)
+    if method == "post" and path == f"/tabs/{_TAB_ID}/action":
+        return _json_response({})
+    if method == "post" and path == f"/tabs/{_TAB_ID}/close":
+        return _json_response({})
+    if method == "post" and path == f"/instances/{_INSTANCE_ID}/stop":
+        return _json_response({})
+
+    msg = f"Unexpected {method.upper()} {path}"
+    raise AssertionError(msg)
+
+
+def _make_adapter_mock() -> Mock:
+    """Build a mock httpx.Client for BrowserAdapter tests."""
+    client = Mock(spec=httpx.Client)
+    client.post = Mock(side_effect=lambda url, **kw: _adapter_route("post", url, **kw))
+    client.get = Mock(side_effect=lambda url, **kw: _adapter_route("get", url, **kw))
+    return client
+
+
+@pytest.fixture()
+def adapter_http() -> Mock:
+    return _make_adapter_mock()
+
+
+@pytest.fixture()
+def adapter(adapter_http: Mock) -> BrowserAdapter:
+    return BrowserAdapter(_http_client=adapter_http)
+
+
+class TestBrowserAdapterNavigate:
+    """BrowserAdapter.navigate() returns PageSnapshot with links."""
+
+    def test_navigate_returns_page_snapshot(self, adapter: BrowserAdapter) -> None:
+        result = adapter.navigate(_PAGE_URL)
+
+        assert isinstance(result, PageSnapshot)
+        assert result.url == _PAGE_URL
+        assert result.title == _PAGE_TITLE
+        assert result.text_content == _PAGE_TEXT
+        assert len(result.links) == 2
+        assert result.links[0] == PageLink(
+            text="Page 1", url="https://example.com/page1", element_ref="e0"
+        )
+
+    def test_navigate_starts_instance_on_first_call(
+        self, adapter: BrowserAdapter, adapter_http: Mock
+    ) -> None:
+        adapter.navigate(_PAGE_URL)
+
+        start_calls = [
+            c for c in adapter_http.post.call_args_list if "/instances/start" in str(c)
+        ]
+        assert len(start_calls) == 1
+
+    def test_navigate_reuses_instance_on_second_call(
+        self, adapter: BrowserAdapter, adapter_http: Mock
+    ) -> None:
+        adapter.navigate(_PAGE_URL)
+        adapter.navigate(_PAGE_URL)
+
+        start_calls = [
+            c for c in adapter_http.post.call_args_list if "/instances/start" in str(c)
+        ]
+        assert len(start_calls) == 1
+
+    def test_navigate_closes_old_tab_before_opening_new(
+        self, adapter: BrowserAdapter, adapter_http: Mock
+    ) -> None:
+        adapter.navigate(_PAGE_URL)
+        adapter_http.post.reset_mock()
+        adapter.navigate(_PAGE_URL)
+
+        call_paths = [str(c) for c in adapter_http.post.call_args_list]
+        close_calls = [c for c in call_paths if "/close" in c]
+        open_calls = [c for c in call_paths if "/tabs/open" in c]
+        assert len(close_calls) == 1
+        assert len(open_calls) == 1
+
+    def test_navigate_connection_error(self, adapter_http: Mock) -> None:
+        adapter_http.post = Mock(side_effect=httpx.ConnectError("Connection refused"))
+        adapter = BrowserAdapter(_http_client=adapter_http)
+
+        with pytest.raises(BrowserConnectionError):
+            adapter.navigate(_PAGE_URL)
+
+    def test_navigate_timeout_error(self, adapter_http: Mock) -> None:
+        original_post = adapter_http.post.side_effect
+
+        def timeout_on_navigate(url: str, **kw: Any) -> httpx.Response:
+            if "/navigate" in url:
+                raise httpx.ReadTimeout("Timed out")
+            return original_post(url, **kw)
+
+        adapter_http.post = Mock(side_effect=timeout_on_navigate)
+        adapter = BrowserAdapter(_http_client=adapter_http)
+
+        with pytest.raises(BrowserTimeoutError):
+            adapter.navigate(_PAGE_URL)
+
+
+class TestBrowserAdapterClick:
+    """BrowserAdapter.click() posts action and returns snapshot."""
+
+    def test_click_posts_action_and_returns_snapshot(
+        self, adapter: BrowserAdapter, adapter_http: Mock
+    ) -> None:
+        adapter.navigate(_PAGE_URL)
+        result = adapter.click("e0")
+
+        assert isinstance(result, PageSnapshot)
+        action_calls = [
+            c for c in adapter_http.post.call_args_list if "/action" in str(c)
+        ]
+        assert len(action_calls) == 1
+        payload = action_calls[0].kwargs.get("json", {})
+        assert payload == {"kind": "click", "ref": "e0"}
+
+    def test_click_without_session_raises(self) -> None:
+        adapter = BrowserAdapter(_http_client=_make_adapter_mock())
+
+        with pytest.raises(BrowserError, match="No active tab"):
+            adapter.click("e0")
+
+
+class TestBrowserAdapterGetSnapshot:
+    """BrowserAdapter.get_snapshot() returns current page state."""
+
+    def test_get_snapshot_returns_current_state(self, adapter: BrowserAdapter) -> None:
+        adapter.navigate(_PAGE_URL)
+        result = adapter.get_snapshot()
+
+        assert isinstance(result, PageSnapshot)
+        assert result.text_content == _PAGE_TEXT
+        assert len(result.links) == 2
+
+    def test_get_snapshot_without_session_raises(self) -> None:
+        adapter = BrowserAdapter(_http_client=_make_adapter_mock())
+
+        with pytest.raises(BrowserError, match="No active tab"):
+            adapter.get_snapshot()
+
+
+class TestBrowserAdapterLifecycle:
+    """BrowserAdapter lifecycle management."""
+
+    def test_close_session_stops_instance(
+        self, adapter: BrowserAdapter, adapter_http: Mock
+    ) -> None:
+        adapter.navigate(_PAGE_URL)
+        adapter.close_session()
+
+        stop_calls = [c for c in adapter_http.post.call_args_list if "/stop" in str(c)]
+        assert len(stop_calls) == 1
+        assert adapter._instance_id is None
+        assert adapter._tab_id is None
+
+    def test_close_session_idempotent(self, adapter: BrowserAdapter) -> None:
+        adapter.close_session()
+        adapter.close_session()  # Should not raise
+
+    def test_context_manager_calls_close_session(self, adapter_http: Mock) -> None:
+        with BrowserAdapter(_http_client=adapter_http) as a:
+            a.navigate(_PAGE_URL)
+
+        stop_calls = [c for c in adapter_http.post.call_args_list if "/stop" in str(c)]
+        assert len(stop_calls) == 1
+
+
+class TestParseLinks:
+    """BrowserAdapter._parse_links() extracts anchors with ref attributes."""
+
+    def test_parse_links_extracts_anchors_with_ref(self) -> None:
+        adapter = BrowserAdapter()
+        html = (
+            '<a ref="e0" href="https://example.com/a">Link A</a>'
+            '<a ref="e1" href="https://example.com/b">Link B</a>'
+            '<a href="https://example.com/c">No Ref</a>'
+            '<span ref="e2">Not a link</span>'
+        )
+        links = adapter._parse_links(html)
+
+        assert len(links) == 2
+        assert links[0] == PageLink(
+            text="Link A", url="https://example.com/a", element_ref="e0"
+        )
+        assert links[1] == PageLink(
+            text="Link B", url="https://example.com/b", element_ref="e1"
+        )

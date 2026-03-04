@@ -270,8 +270,15 @@ class BrowserAdapter:
             page2 = browser.click("e3")
     """
 
-    def __init__(self, base_url: str = _DEFAULT_BASE_URL) -> None:
+    def __init__(
+        self,
+        base_url: str = _DEFAULT_BASE_URL,
+        headless: bool = True,
+        _http_client: httpx.Client | None = None,
+    ) -> None:
         self._base_url = base_url
+        self._headless = headless
+        self._http_client = _http_client or httpx.Client()
         self._instance_id: str | None = None
         self._tab_id: str | None = None
 
@@ -286,6 +293,85 @@ class BrowserAdapter:
     ) -> None:
         self.close_session()
 
+    # -- Internal helpers ---------------------------------------------------
+
+    def _ensure_instance(self) -> None:
+        """Start a Chrome instance if one isn't running."""
+        if self._instance_id is not None:
+            return
+        try:
+            mode = "headless" if self._headless else "headed"
+            resp = self._http_client.post(
+                f"{self._base_url}/instances/start",
+                json={"profileId": "", "mode": mode},
+            )
+            resp.raise_for_status()
+            data = _InstanceResponse.model_validate(resp.json())
+            self._instance_id = data.id
+        except httpx.ConnectError as exc:
+            msg = f"Cannot connect to PinchTab at {self._base_url}"
+            raise BrowserConnectionError(msg) from exc
+        except httpx.HTTPStatusError as exc:
+            msg = f"PinchTab instance start failed: {exc.response.status_code}"
+            raise BrowserError(msg) from exc
+
+    def _require_tab(self) -> str:
+        """Return the active tab ID or raise."""
+        if self._tab_id is None:
+            msg = "No active tab — call navigate() first"
+            raise BrowserError(msg)
+        return self._tab_id
+
+    def _fetch_snapshot(self) -> PageSnapshot:
+        """Get text + accessibility snapshot for the current tab."""
+        tab_id = self._require_tab()
+        try:
+            text_resp = self._http_client.get(
+                f"{self._base_url}/tabs/{tab_id}/text",
+            )
+            text_resp.raise_for_status()
+
+            snap_resp = self._http_client.get(
+                f"{self._base_url}/tabs/{tab_id}/snapshot",
+            )
+            snap_resp.raise_for_status()
+
+            # Tab response doesn't give us updated title/url — use text
+            # endpoint info.  PinchTab tab open gives us the initial values.
+            return PageSnapshot(
+                url=self._current_url,
+                title=self._current_title,
+                text_content=text_resp.text,
+                links=self._parse_links(snap_resp.text),
+            )
+        except httpx.ConnectError as exc:
+            msg = f"Lost connection to PinchTab at {self._base_url}"
+            raise BrowserConnectionError(msg) from exc
+        except httpx.HTTPStatusError as exc:
+            msg = f"Snapshot failed: PinchTab returned {exc.response.status_code}"
+            raise BrowserNavigationError(msg) from exc
+
+    def _parse_links(self, snapshot_str: str) -> list[PageLink]:
+        """Extract links from accessibility snapshot HTML."""
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(snapshot_str, "html.parser")
+        links: list[PageLink] = []
+        for tag in soup.find_all("a"):
+            ref = tag.get("ref")
+            href = tag.get("href")
+            if ref and href:
+                links.append(
+                    PageLink(
+                        text=tag.get_text(strip=True),
+                        url=str(href),
+                        element_ref=str(ref),
+                    )
+                )
+        return links
+
+    # -- Public API ---------------------------------------------------------
+
     def navigate(self, url: str, timeout: int = 30) -> PageSnapshot:
         """Navigate to *url* and return the resulting page snapshot.
 
@@ -294,7 +380,50 @@ class BrowserAdapter:
             BrowserNavigationError: If PinchTab returns a non-2xx status.
             BrowserConnectionError: If PinchTab server is unreachable.
         """
-        raise NotImplementedError("Real PinchTab HTTP calls — see Slice 1.9")
+        try:
+            self._ensure_instance()
+
+            # Close existing tab if one is open
+            if self._tab_id is not None:
+                with contextlib.suppress(httpx.HTTPError):
+                    self._http_client.post(
+                        f"{self._base_url}/tabs/{self._tab_id}/close",
+                    )
+                self._tab_id = None
+
+            # Open new tab
+            resp = self._http_client.post(
+                f"{self._base_url}/instances/{self._instance_id}/tabs/open",
+                json={"url": url},
+            )
+            resp.raise_for_status()
+            tab_data = _TabResponse.model_validate(resp.json())
+            self._tab_id = tab_data.tabId
+            self._current_url = url
+            self._current_title = tab_data.title
+
+            # Navigate
+            resp = self._http_client.post(
+                f"{self._base_url}/tabs/{self._tab_id}/navigate",
+                json={"url": url, "timeout": timeout, "blockImages": True},
+                timeout=timeout + _HTTPX_BUFFER_SECONDS,
+            )
+            resp.raise_for_status()
+
+            return self._fetch_snapshot()
+
+        except httpx.ConnectError as exc:
+            msg = f"Cannot connect to PinchTab at {self._base_url}"
+            raise BrowserConnectionError(msg) from exc
+        except httpx.TimeoutException as exc:
+            msg = f"Page load timed out after {timeout}s for {url}"
+            raise BrowserTimeoutError(msg) from exc
+        except httpx.HTTPStatusError as exc:
+            msg = (
+                f"Navigation failed for {url}: "
+                f"PinchTab returned {exc.response.status_code}"
+            )
+            raise BrowserNavigationError(msg) from exc
 
     def click(self, element_ref: str, timeout: int = 30) -> PageSnapshot:
         """Click an element by its PinchTab ref and return the resulting page.
@@ -302,11 +431,40 @@ class BrowserAdapter:
         Raises:
             BrowserError: If the click or subsequent page load fails.
         """
-        raise NotImplementedError("Real PinchTab HTTP calls — see Slice 1.9")
+        tab_id = self._require_tab()
+        try:
+            resp = self._http_client.post(
+                f"{self._base_url}/tabs/{tab_id}/action",
+                json={"kind": "click", "ref": element_ref},
+                timeout=timeout + _HTTPX_BUFFER_SECONDS,
+            )
+            resp.raise_for_status()
+            return self._fetch_snapshot()
+        except httpx.ConnectError as exc:
+            msg = f"Lost connection to PinchTab at {self._base_url}"
+            raise BrowserConnectionError(msg) from exc
+        except httpx.TimeoutException as exc:
+            msg = f"Click timed out after {timeout}s"
+            raise BrowserTimeoutError(msg) from exc
+        except httpx.HTTPStatusError as exc:
+            msg = f"Click failed: PinchTab returned {exc.response.status_code}"
+            raise BrowserNavigationError(msg) from exc
 
     def get_snapshot(self) -> PageSnapshot:
         """Get a snapshot of the current page without navigating."""
-        raise NotImplementedError("Real PinchTab HTTP calls — see Slice 1.9")
+        return self._fetch_snapshot()
 
     def close_session(self) -> None:
         """Stop the Chrome instance.  Safe to call multiple times."""
+        if self._tab_id is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                self._http_client.post(
+                    f"{self._base_url}/tabs/{self._tab_id}/close",
+                )
+            self._tab_id = None
+        if self._instance_id is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                self._http_client.post(
+                    f"{self._base_url}/instances/{self._instance_id}/stop",
+                )
+            self._instance_id = None
