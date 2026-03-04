@@ -1,8 +1,15 @@
-"""PinchTab browser adapter — thin wrapper around PinchTab's HTTP API."""
+"""PinchTab browser adapter — thin wrapper around PinchTab's HTTP API.
+
+Provides two layers:
+- ``BrowserClient``: low-level HTTP adapter (Slice 1.9) with ``navigate()``
+- ``BrowserAdapter``: higher-level adapter (Slice 1.10) adding ``click()``
+  and ``get_snapshot()`` for the agentic navigator
+"""
 
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -45,12 +52,12 @@ class _TabResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Public Pydantic model
+# Public data classes — navigator's view of a browser page
 # ---------------------------------------------------------------------------
 
 
 class PageContent(BaseModel):
-    """Content retrieved from a navigated page."""
+    """Content retrieved from a navigated page (low-level)."""
 
     url: str
     title: str
@@ -58,8 +65,27 @@ class PageContent(BaseModel):
     snapshot: str
 
 
+@dataclass(frozen=True)
+class PageLink:
+    """A link discovered on a page via the accessibility snapshot."""
+
+    text: str
+    url: str
+    element_ref: str  # PinchTab element reference (e.g., "e0", "e1")
+
+
+@dataclass(frozen=True)
+class PageSnapshot:
+    """Snapshot of the current browser page state (high-level)."""
+
+    url: str
+    title: str
+    text_content: str
+    links: list[PageLink] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
-# Browser client
+# BrowserClient — low-level PinchTab HTTP adapter (Slice 1.9)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_BASE_URL = "http://localhost:9867"
@@ -226,3 +252,61 @@ class BrowserClient:
                     self._http_client.post(
                         f"{self._base_url}/tabs/{tab_id}/close",
                     )
+
+
+# ---------------------------------------------------------------------------
+# BrowserAdapter — high-level adapter for agentic navigation (Slice 1.10)
+# ---------------------------------------------------------------------------
+
+
+class BrowserAdapter:
+    """Higher-level adapter for the agentic navigator.
+
+    Adds ``click()`` and ``get_snapshot()`` on top of basic navigation.
+    Manages a persistent tab for multi-step browsing sessions::
+
+        with BrowserAdapter() as browser:
+            page = browser.navigate("https://example.com")
+            page2 = browser.click("e3")
+    """
+
+    def __init__(self, base_url: str = _DEFAULT_BASE_URL) -> None:
+        self._base_url = base_url
+        self._instance_id: str | None = None
+        self._tab_id: str | None = None
+
+    def __enter__(self) -> BrowserAdapter:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        self.close_session()
+
+    def navigate(self, url: str, timeout: int = 30) -> PageSnapshot:
+        """Navigate to *url* and return the resulting page snapshot.
+
+        Raises:
+            BrowserTimeoutError: If page load exceeds *timeout*.
+            BrowserNavigationError: If PinchTab returns a non-2xx status.
+            BrowserConnectionError: If PinchTab server is unreachable.
+        """
+        raise NotImplementedError("Real PinchTab HTTP calls — see Slice 1.9")
+
+    def click(self, element_ref: str, timeout: int = 30) -> PageSnapshot:
+        """Click an element by its PinchTab ref and return the resulting page.
+
+        Raises:
+            BrowserError: If the click or subsequent page load fails.
+        """
+        raise NotImplementedError("Real PinchTab HTTP calls — see Slice 1.9")
+
+    def get_snapshot(self) -> PageSnapshot:
+        """Get a snapshot of the current page without navigating."""
+        raise NotImplementedError("Real PinchTab HTTP calls — see Slice 1.9")
+
+    def close_session(self) -> None:
+        """Stop the Chrome instance.  Safe to call multiple times."""
