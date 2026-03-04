@@ -1,0 +1,58 @@
+banks:
+  - name: Federal Reserve
+    country: US
+    homepage_url: https://www.federalreserve.gov
+    press_releases_url: https://www.federalreserve.gov/newsevents/pressreleases.htm
+    page_load_timeout: 30
+
+  - name: European Central Bank
+    country: Eurozone
+    homepage_url: https://www.ecb.europa.eu
+    press_releases_url: https://www.ecb.europa.eu/press/pr/html/index.en.html
+    page_load_timeout: 30
+
+  - name: Bank of Japan
+    country: Japan
+    homepage_url: https://www.boj.or.jp/en
+    press_releases_url: https://www.boj.or.jp/en/announcements/release_index.htm
+    page_load_timeout: 30
+
+  - name: People's Bank of China
+    country: China
+    homepage_url: http://www.pbc.gov.cn/en
+    page_load_timeout: 30
+
+  - name: Bank of England
+    country: UK
+    homepage_url: https://www.bankofengland.co.uk
+    press_releases_url: https://www.bankofengland.co.uk/news
+    page_load_timeout: 30
+
+  - name: Swiss National Bank
+    country: Switzerland
+    homepage_url: https://www.snb.ch/en
+    press_releases_url: https://www.snb.ch/en/news
+    page_load_timeout: 30
+
+  - name: Bank of Canada
+    country: Canada
+    homepage_url: https://www.bankofcanada.ca
+    press_releases_url: https://www.bankofcanada.ca/press/
+    page_load_timeout: 30
+
+  - name: Reserve Bank of Australia
+    country: Australia
+    homepage_url: https://www.rba.gov.au
+    press_releases_url: https://www.rba.gov.au/media-releases/
+    page_load_timeout: 30
+
+  - name: Reserve Bank of India
+    country: India
+    homepage_url: https://www.rbi.org.in
+    press_releases_url: https://www.rbi.org.in/Scripts/PressReleaseDisplay.aspx
+    page_load_timeout: 30
+
+  - name: Banco de la República
+    country: Colombia
+    homepage_url: https://www.banrep.gov.co
+    page_load_timeout: 30
