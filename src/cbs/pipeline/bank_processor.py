@@ -78,7 +78,10 @@ class DefaultBankProcessor:
                 result.errors.append(error_msg)
                 continue
 
-            result.press_releases_found += 1
-            result.swaps_extracted += len(pipeline_result.swap_ids)
+            if pipeline_result.skipped_duplicate:
+                result.skipped_duplicates += 1
+            else:
+                result.press_releases_found += 1
+                result.swaps_extracted += len(pipeline_result.swap_ids)
 
         return result

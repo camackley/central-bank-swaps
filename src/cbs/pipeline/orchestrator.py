@@ -51,10 +51,17 @@ class Orchestrator:
         conn: duckdb.DuckDBPyConnection,
         llm: BaseChatModel,
         browser: BrowserAdapter,
+        *,
+        classify_llm: BaseChatModel | None = None,
+        extract_llm: BaseChatModel | None = None,
+        translate_llm: BaseChatModel | None = None,
     ) -> None:
         self._conn = conn
         self._llm = llm
         self._browser = browser
+        self._classify_llm = classify_llm or llm
+        self._extract_llm = extract_llm or llm
+        self._translate_llm = translate_llm or llm
 
     def process_press_release(
         self,
@@ -99,14 +106,14 @@ class Orchestrator:
         pr_id = insert_press_release(self._conn, pr)
 
         # 3. Detect language + translate
-        lang_code = detect_language(self._llm, extract_result.body)
+        lang_code = detect_language(self._translate_llm, extract_result.body)
         translation = translate_text(
-            self._llm, extract_result.body, original_language=lang_code
+            self._translate_llm, extract_result.body, original_language=lang_code
         )
         body_en = translation.body_en
 
         # 4. Classify
-        classification = classify_press_release(self._llm, body_en)
+        classification = classify_press_release(self._classify_llm, body_en)
 
         # 5. Update press release with classification + translation results
         self._conn.execute(
@@ -132,7 +139,7 @@ class Orchestrator:
             )
 
         # 6. Extract swaps and insert each direction
-        extraction = extract_swaps(self._llm, body_en)
+        extraction = extract_swaps(self._extract_llm, body_en)
         swap_ids: list[uuid.UUID] = []
 
         for swap_record in extraction.swaps:

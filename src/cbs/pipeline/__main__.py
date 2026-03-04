@@ -16,6 +16,7 @@ from cbs.db.schema import init_db
 from cbs.llm.provider import get_llm
 from cbs.pipeline.backfill import BackfillOrchestrator
 from cbs.pipeline.bank_processor import DefaultBankProcessor
+from cbs.pipeline.incremental import IncrementalOrchestrator
 from cbs.pipeline.orchestrator import Orchestrator
 from cbs.scraper.browser import BrowserAdapter
 
@@ -55,6 +56,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max listing pages to paginate per bank (default: 5)",
     )
     parser.add_argument(
+        "--classify-model",
+        default=None,
+        help="Override LLM model for classification stage (e.g. claude-haiku-3-5)",
+    )
+    parser.add_argument(
+        "--extract-model",
+        default=None,
+        help="Override LLM model for extraction stage (e.g. claude-sonnet-4-20250514)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["backfill", "incremental"],
+        default="backfill",
+        help="Run mode: backfill (full history) or incremental (new only)",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Resume an existing run by UUID",
@@ -70,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run the backfill pipeline."""
+    """Run the pipeline in backfill or incremental mode."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -87,12 +104,24 @@ def main(argv: list[str] | None = None) -> None:
     conn = duckdb.connect(args.db)
     init_db(conn)
 
-    # Set up LLM
+    # Set up LLMs
     llm = get_llm(args.provider, args.model)
+    classify_llm = (
+        get_llm(args.provider, args.classify_model) if args.classify_model else None
+    )
+    extract_llm = (
+        get_llm(args.provider, args.extract_model) if args.extract_model else None
+    )
 
     # Wire pipeline
     with BrowserAdapter() as browser:
-        orchestrator = Orchestrator(conn=conn, llm=llm, browser=browser)
+        orchestrator = Orchestrator(
+            conn=conn,
+            llm=llm,
+            browser=browser,
+            classify_llm=classify_llm,
+            extract_llm=extract_llm,
+        )
         processor = DefaultBankProcessor(
             orchestrator=orchestrator,
             browser=browser,
@@ -100,26 +129,35 @@ def main(argv: list[str] | None = None) -> None:
             max_pages=args.max_pages,
         )
         run_manager = RunManager(conn)
-        backfill = BackfillOrchestrator(
-            conn=conn,
-            run_manager=run_manager,
-            bank_processor=processor,
-            banks_config=banks_config,
-        )
-
         resume_id = UUID(args.resume) if args.resume else None
+
+        runner: BackfillOrchestrator | IncrementalOrchestrator
+        if args.mode == "incremental":
+            runner = IncrementalOrchestrator(
+                conn=conn,
+                run_manager=run_manager,
+                bank_processor=processor,
+                banks_config=banks_config,
+            )
+        else:
+            runner = BackfillOrchestrator(
+                conn=conn,
+                run_manager=run_manager,
+                bank_processor=processor,
+                banks_config=banks_config,
+            )
 
         if args.schedule is not None:
             from cbs.scheduler import PipelineScheduler
 
             scheduler = PipelineScheduler(
-                run_fn=lambda: backfill.run(),
+                run_fn=lambda: runner.run(),
                 interval_days=args.schedule,
             )
             scheduler.start()  # blocks forever
             return
 
-        summary = backfill.run(resume_run_id=resume_id)
+        summary = runner.run(resume_run_id=resume_id)
 
     conn.close()
 
