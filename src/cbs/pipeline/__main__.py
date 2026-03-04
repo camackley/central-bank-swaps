@@ -76,6 +76,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Resume an existing run by UUID",
     )
+    parser.add_argument(
+        "--schedule",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Run on a recurring schedule every N days (blocks forever)",
+    )
     return parser
 
 
@@ -139,6 +146,16 @@ def main(argv: list[str] | None = None) -> None:
                 bank_processor=processor,
                 banks_config=banks_config,
             )
+
+        if args.schedule is not None:
+            from cbs.scheduler import PipelineScheduler
+
+            scheduler = PipelineScheduler(
+                run_fn=lambda: runner.run(),
+                interval_days=args.schedule,
+            )
+            scheduler.start()  # blocks forever
+            return
 
         summary = runner.run(resume_run_id=resume_id)
 
