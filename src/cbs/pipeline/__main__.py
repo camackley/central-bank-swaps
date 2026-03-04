@@ -16,6 +16,7 @@ from cbs.db.schema import init_db
 from cbs.llm.provider import get_llm
 from cbs.pipeline.backfill import BackfillOrchestrator
 from cbs.pipeline.bank_processor import DefaultBankProcessor
+from cbs.pipeline.incremental import IncrementalOrchestrator
 from cbs.pipeline.orchestrator import Orchestrator
 from cbs.scraper.browser import BrowserAdapter
 
@@ -65,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override LLM model for extraction stage (e.g. claude-sonnet-4-20250514)",
     )
     parser.add_argument(
+        "--mode",
+        choices=["backfill", "incremental"],
+        default="backfill",
+        help="Run mode: backfill (full history) or incremental (new only)",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Resume an existing run by UUID",
@@ -73,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run the backfill pipeline."""
+    """Run the pipeline in backfill or incremental mode."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -115,15 +122,25 @@ def main(argv: list[str] | None = None) -> None:
             max_pages=args.max_pages,
         )
         run_manager = RunManager(conn)
-        backfill = BackfillOrchestrator(
-            conn=conn,
-            run_manager=run_manager,
-            bank_processor=processor,
-            banks_config=banks_config,
-        )
-
         resume_id = UUID(args.resume) if args.resume else None
-        summary = backfill.run(resume_run_id=resume_id)
+
+        runner: BackfillOrchestrator | IncrementalOrchestrator
+        if args.mode == "incremental":
+            runner = IncrementalOrchestrator(
+                conn=conn,
+                run_manager=run_manager,
+                bank_processor=processor,
+                banks_config=banks_config,
+            )
+        else:
+            runner = BackfillOrchestrator(
+                conn=conn,
+                run_manager=run_manager,
+                bank_processor=processor,
+                banks_config=banks_config,
+            )
+
+        summary = runner.run(resume_run_id=resume_id)
 
     conn.close()
 
