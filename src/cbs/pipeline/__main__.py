@@ -59,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Resume an existing run by UUID",
     )
+    parser.add_argument(
+        "--schedule",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Run on a recurring schedule every N days (blocks forever)",
+    )
     return parser
 
 
@@ -101,6 +108,17 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         resume_id = UUID(args.resume) if args.resume else None
+
+        if args.schedule is not None:
+            from cbs.scheduler import PipelineScheduler
+
+            scheduler = PipelineScheduler(
+                run_fn=lambda: backfill.run(),
+                interval_days=args.schedule,
+            )
+            scheduler.start()  # blocks forever
+            return
+
         summary = backfill.run(resume_run_id=resume_id)
 
     conn.close()
