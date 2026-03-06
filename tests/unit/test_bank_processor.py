@@ -11,6 +11,9 @@ from cbs.pipeline.models import BankProcessingResult
 from cbs.pipeline.orchestrator import Orchestrator, PipelineResult
 from cbs.scraper.browser import BrowserAdapter, PageLink, PageSnapshot
 from cbs.scraper.models import DiscoveredPressRelease, NavigationResult
+from cbs.scraper.pdf_extractor import PDFChunk, PDFExtractResult
+
+_PDF_BODY = "PDF body text " + "x" * 60
 
 
 def _make_bank() -> BankConfig:
@@ -25,7 +28,10 @@ def _make_snapshot(url: str = "https://example.com/pr1") -> PageSnapshot:
     return PageSnapshot(
         url=url,
         title="Press Release",
-        text_content="Body text of the press release.",
+        text_content=(
+            "Body text of the press release about central"
+            " bank swap agreements and monetary policy."
+        ),
         links=[PageLink(text="Link", url="https://example.com", element_ref="e0")],
     )
 
@@ -213,3 +219,180 @@ class TestBankNameAndCountryForwarded:
         call_kwargs = orchestrator.process_press_release.call_args
         assert call_kwargs.kwargs["bank_name"] == "ECB"
         assert call_kwargs.kwargs["country"] == "Eurozone"
+
+
+# ---------------------------------------------------------------------------
+# PDF routing tests
+# ---------------------------------------------------------------------------
+
+
+class TestPdfUrlDownloadsAndExtracts:
+    """PDF URLs should be downloaded and extracted, not navigated via PinchTab."""
+
+    @patch("cbs.pipeline.bank_processor._download_and_extract_pdf")
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_pdf_url_downloads_and_extracts(
+        self, mock_find: MagicMock, mock_pdf: MagicMock
+    ) -> None:
+        urls = ["https://example.com/docs/report.pdf"]
+        mock_find.return_value = _make_nav_result(urls)
+        mock_pdf.return_value = PDFExtractResult(
+            text=_PDF_BODY,
+            page_count=1,
+            chunks=[
+                PDFChunk(
+                    text=_PDF_BODY,
+                    start_page=1,
+                    end_page=1,
+                )
+            ],
+            extractor="pymupdf",
+        )
+        browser = MagicMock(spec=BrowserAdapter)
+        orchestrator = MagicMock(spec=Orchestrator)
+        orchestrator.process_press_release.return_value = PipelineResult(
+            press_release_id=uuid.uuid4()
+        )
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        processor.process_bank(_make_bank())
+
+        # Browser.navigate should NOT be called for PDF URLs
+        browser.navigate.assert_not_called()
+        mock_pdf.assert_called_once_with("https://example.com/docs/report.pdf")
+
+    @patch("cbs.pipeline.bank_processor._download_and_extract_pdf")
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_pdf_body_sent_to_orchestrator(
+        self, mock_find: MagicMock, mock_pdf: MagicMock
+    ) -> None:
+        urls = ["https://example.com/docs/report.pdf"]
+        mock_find.return_value = _make_nav_result(urls)
+        mock_pdf.return_value = PDFExtractResult(
+            text=_PDF_BODY,
+            page_count=1,
+            chunks=[
+                PDFChunk(
+                    text=_PDF_BODY,
+                    start_page=1,
+                    end_page=1,
+                )
+            ],
+            extractor="pymupdf",
+        )
+        browser = MagicMock(spec=BrowserAdapter)
+        orchestrator = MagicMock(spec=Orchestrator)
+        orchestrator.process_press_release.return_value = PipelineResult(
+            press_release_id=uuid.uuid4()
+        )
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        processor.process_bank(_make_bank())
+
+        call_args = orchestrator.process_press_release.call_args[0][0]
+        assert "PDF body text" in call_args.body
+
+    @patch("cbs.pipeline.bank_processor._download_and_extract_pdf")
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_pdf_extraction_error_captured(
+        self, mock_find: MagicMock, mock_pdf: MagicMock
+    ) -> None:
+        urls = ["https://example.com/docs/broken.pdf", "https://example.com/pr1"]
+        mock_find.return_value = _make_nav_result(urls)
+        mock_pdf.side_effect = RuntimeError("download failed")
+        browser = MagicMock(spec=BrowserAdapter)
+        browser.navigate.return_value = _make_snapshot("https://example.com/pr1")
+        orchestrator = MagicMock(spec=Orchestrator)
+        orchestrator.process_press_release.return_value = PipelineResult(
+            press_release_id=uuid.uuid4()
+        )
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        result = processor.process_bank(_make_bank())
+
+        assert any("PDF extraction failed" in e for e in result.errors)
+        # Second (non-PDF) URL should still be processed
+        assert result.press_releases_found == 1
+
+
+# ---------------------------------------------------------------------------
+# Guard tests: empty body, 404, listing page
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyBodySkipped:
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_empty_body_skipped(self, mock_find: MagicMock) -> None:
+        mock_find.return_value = _make_nav_result(["https://example.com/pr1"])
+        browser = MagicMock(spec=BrowserAdapter)
+        browser.navigate.return_value = PageSnapshot(
+            url="https://example.com/pr1",
+            title="Press Release",
+            text_content="   ",  # effectively empty
+            links=[],
+        )
+        orchestrator = MagicMock(spec=Orchestrator)
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        result = processor.process_bank(_make_bank())
+
+        orchestrator.process_press_release.assert_not_called()
+        assert any("Empty/short body" in e for e in result.errors)
+
+
+class TestErrorPageSkipped:
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_404_page_skipped(self, mock_find: MagicMock) -> None:
+        mock_find.return_value = _make_nav_result(["https://example.com/missing"])
+        browser = MagicMock(spec=BrowserAdapter)
+        browser.navigate.return_value = PageSnapshot(
+            url="https://example.com/missing",
+            title="Page not found",
+            text_content=(
+                "The page you are looking for does not"
+                " exist. Error 404. Please go back."
+            ),
+            links=[],
+        )
+        orchestrator = MagicMock(spec=Orchestrator)
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        result = processor.process_bank(_make_bank())
+
+        orchestrator.process_press_release.assert_not_called()
+        assert any("Error page" in e for e in result.errors)
+
+
+class TestListingPageUrlSkipped:
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_listing_page_url_skipped(self, mock_find: MagicMock) -> None:
+        listing_url = "https://example.com/press-releases"
+        nav = _make_nav_result([listing_url, "https://example.com/pr1"])
+        nav.listing_page_url = listing_url
+        mock_find.return_value = nav
+
+        browser = MagicMock(spec=BrowserAdapter)
+        browser.navigate.return_value = _make_snapshot("https://example.com/pr1")
+        orchestrator = MagicMock(spec=Orchestrator)
+        orchestrator.process_press_release.return_value = PipelineResult(
+            press_release_id=uuid.uuid4()
+        )
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        result = processor.process_bank(_make_bank())
+
+        # Only the non-listing URL should be processed
+        assert result.press_releases_found == 1
+        assert browser.navigate.call_count == 1

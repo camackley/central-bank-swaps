@@ -12,6 +12,7 @@ from datetime import date
 
 import duckdb
 from langchain_core.language_models.chat_models import BaseChatModel
+from langsmith import traceable
 
 from cbs.db.press_release_repo import PressRelease, insert_press_release
 from cbs.db.swap_repo import SwapCreate, insert_swap
@@ -63,6 +64,7 @@ class Orchestrator:
         self._extract_llm = extract_llm or llm
         self._translate_llm = translate_llm or llm
 
+    @traceable(name="process_press_release", run_type="chain")
     def process_press_release(
         self,
         extract_result: HtmlExtractResult,

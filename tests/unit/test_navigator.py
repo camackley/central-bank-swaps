@@ -14,6 +14,7 @@ from cbs.scraper.browser import BrowserAdapter, PageLink, PageSnapshot
 from cbs.scraper.models import NavigationResult
 from cbs.scraper.navigator import (
     _extract_press_releases_from_snapshot,
+    _filter_off_domain,
     find_press_releases,
 )
 
@@ -466,3 +467,55 @@ class TestFilterPromptAndSafetyNet:
         )
 
         assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. test_off_domain_urls_filtered
+# ---------------------------------------------------------------------------
+
+
+class TestOffDomainUrlsFiltered:
+    """Off-domain URLs (social media, etc.) are removed from results."""
+
+    def test_off_domain_urls_filtered(self) -> None:
+        from cbs.scraper.models import DiscoveredPressRelease
+
+        press_releases = [
+            DiscoveredPressRelease(
+                url="https://www.federalreserve.gov/pr/2024-01",
+                title="Swap agreement",
+            ),
+            DiscoveredPressRelease(
+                url="https://www.instagram.com/federalreserve",
+                title="Instagram",
+            ),
+            DiscoveredPressRelease(
+                url="https://twitter.com/federalreserve",
+                title="Twitter",
+            ),
+            DiscoveredPressRelease(
+                url="https://www.federalreserve.gov/pr/2024-02",
+                title="Rate decision",
+            ),
+        ]
+
+        filtered = _filter_off_domain(press_releases, "www.federalreserve.gov")
+
+        assert len(filtered) == 2
+        urls = [pr.url for pr in filtered]
+        assert "https://www.federalreserve.gov/pr/2024-01" in urls
+        assert "https://www.federalreserve.gov/pr/2024-02" in urls
+
+    def test_subdomain_kept(self) -> None:
+        from cbs.scraper.models import DiscoveredPressRelease
+
+        press_releases = [
+            DiscoveredPressRelease(
+                url="https://press.testbank.org/release/1",
+                title="PR 1",
+            ),
+        ]
+
+        filtered = _filter_off_domain(press_releases, "www.testbank.org")
+
+        assert len(filtered) == 1

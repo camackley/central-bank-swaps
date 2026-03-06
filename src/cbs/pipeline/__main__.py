@@ -12,6 +12,7 @@ import duckdb
 from dotenv import load_dotenv
 
 from cbs.config.banks import load_bank_config
+from cbs.config.tracing import configure_tracing
 from cbs.db.run_manager import RunManager
 from cbs.db.schema import init_db
 from cbs.llm.provider import get_llm
@@ -95,6 +96,8 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    configure_tracing()
 
     parser = build_parser()
     args = parser.parse_args(argv)

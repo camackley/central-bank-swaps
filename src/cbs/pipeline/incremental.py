@@ -7,6 +7,8 @@ import logging
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from langsmith import traceable
+
 from cbs.config.banks import BankConfig, BanksConfig
 from cbs.db.run_manager import RunManager
 from cbs.db.schema import TABLE_SCRAPING_RUNS
@@ -39,6 +41,7 @@ class IncrementalOrchestrator:
         self._processor = bank_processor
         self._banks_config = banks_config
 
+    @traceable(name="incremental_run", run_type="chain")
     def run(self, resume_run_id: UUID | None = None) -> RunSummary:
         """Execute an incremental update.
 

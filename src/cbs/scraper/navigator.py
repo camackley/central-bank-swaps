@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -196,6 +197,32 @@ def _extract_press_releases_from_snapshot(
         for link in snapshot.links
         if link.element_ref in ref_set
     ]
+
+
+def _base_domain(netloc: str) -> str:
+    """Strip common prefixes (www.) and return the base domain for comparison."""
+    netloc = netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+
+def _filter_off_domain(
+    press_releases: list[DiscoveredPressRelease],
+    bank_domain: str,
+) -> list[DiscoveredPressRelease]:
+    """Remove URLs that point outside the bank's domain."""
+    base = _base_domain(bank_domain)
+    filtered = []
+    for pr in press_releases:
+        pr_domain = urlparse(pr.url).netloc.lower()
+        pr_base = _base_domain(pr_domain)
+        # Allow if the base domains match or one is a subdomain of the other
+        if base in pr_base or pr_base in base:
+            filtered.append(pr)
+        else:
+            logger.info("Filtering off-domain URL: %s", pr.url)
+    return filtered
 
 
 def _log_step(step: NavigationStep) -> None:
@@ -514,6 +541,9 @@ def find_press_releases(
                 browser, llm, bank, snapshot, max_pages - 1, steps
             )
 
+        bank_domain = urlparse(str(bank.press_releases_url)).netloc.lower()
+        press_releases = _filter_off_domain(press_releases, bank_domain)
+
         return NavigationResult(
             bank_name=bank.name,
             press_releases=press_releases,
@@ -532,6 +562,9 @@ def find_press_releases(
         press_releases += _paginate(
             browser, llm, bank, current_snapshot, max_pages - 1, steps
         )
+
+    bank_domain = urlparse(str(bank.homepage_url)).netloc.lower()
+    press_releases = _filter_off_domain(press_releases, bank_domain)
 
     return NavigationResult(
         bank_name=bank.name,
