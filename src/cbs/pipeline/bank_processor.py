@@ -44,9 +44,15 @@ class DefaultBankProcessor:
         result = BankProcessingResult(bank_name=bank.name)
 
         # 1. Find press release URLs
-        nav_result = find_press_releases(
-            bank, self._browser, self._llm, max_pages=self._max_pages
-        )
+        try:
+            nav_result = find_press_releases(
+                bank, self._browser, self._llm, max_pages=self._max_pages
+            )
+        except Exception as exc:
+            error_msg = f"Navigation/discovery failed for {bank.name}: {exc}"
+            logger.error(error_msg)
+            result.errors.append(error_msg)
+            return result
 
         # 2. Process each discovered press release
         for pr in nav_result.press_releases:

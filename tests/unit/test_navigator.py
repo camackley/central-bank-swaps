@@ -12,7 +12,10 @@ from langchain_core.messages import AIMessage
 from cbs.config.banks import BankConfig
 from cbs.scraper.browser import BrowserAdapter, PageLink, PageSnapshot
 from cbs.scraper.models import NavigationResult
-from cbs.scraper.navigator import find_press_releases
+from cbs.scraper.navigator import (
+    _extract_press_releases_from_snapshot,
+    find_press_releases,
+)
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -272,11 +275,13 @@ class TestPaginationDiscoversOlderReleases:
         browser.navigate.return_value = page1
         browser.click.return_value = page2
 
-        # LLM identifies pagination link "Next Page" (e10)
+        # LLM responses: filter page1 links, pagination ref, filter page2, no more pages
         fake_llm = FakeMessagesListChatModel(
             responses=[
-                AIMessage(content='{"element_ref": "e10"}'),
-                AIMessage(content="null"),
+                AIMessage(content='["e0", "e1"]'),  # filter links page 1
+                AIMessage(content='{"element_ref": "e10"}'),  # pagination
+                AIMessage(content='["e0", "e1"]'),  # filter links page 2
+                AIMessage(content="null"),  # no more pages
             ],
         )
 
@@ -310,9 +315,9 @@ class TestPaginationDiscoversOlderReleases:
 
         fake_llm = FakeMessagesListChatModel(
             responses=[
-                AIMessage(content='{"element_ref": "e10"}'),
-                AIMessage(content='{"element_ref": "e10"}'),
-                AIMessage(content='{"element_ref": "e10"}'),
+                AIMessage(content='["e0"]'),  # filter links page 1
+                AIMessage(content='{"element_ref": "e10"}'),  # pagination
+                AIMessage(content='["e0"]'),  # filter links page 2
             ],
         )
 
@@ -336,7 +341,10 @@ class TestPaginationDiscoversOlderReleases:
         )
         browser.navigate.return_value = page
         fake_llm = FakeMessagesListChatModel(
-            responses=[AIMessage(content="null")],
+            responses=[
+                AIMessage(content='["e0"]'),  # filter links page 1
+                AIMessage(content="null"),  # no pagination link
+            ],
         )
 
         result = find_press_releases(bank, browser, fake_llm, max_pages=5)
@@ -391,3 +399,70 @@ class TestNavigationStepsLogged:
             find_press_releases(bank, browser, llm, max_pages=1)
 
         assert any("direct_url" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 5. test_filter_prompt_and_safety_net
+# ---------------------------------------------------------------------------
+
+
+class TestFilterPromptAndSafetyNet:
+    """Filter prompt includes bank context; safety net catches empty results."""
+
+    def test_filter_prompt_includes_bank_name(self) -> None:
+        """The filter prompt sent to the LLM contains the bank name."""
+        snapshot = _make_snapshot(
+            links=[
+                PageLink(text="PR 1", url="https://example.com/pr/1", element_ref="e0"),
+            ],
+        )
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content='["e0"]')
+
+        _extract_press_releases_from_snapshot(
+            snapshot, llm, bank_name="Federal Reserve", page_url="https://fed.gov/press"
+        )
+
+        prompt_text = llm.invoke.call_args[0][0][0].content
+        assert "Federal Reserve" in prompt_text
+        assert "https://fed.gov/press" in prompt_text
+
+    def test_empty_result_safety_net_returns_all_links(self) -> None:
+        """When LLM returns [] but page has >= 5 links, fall back to all."""
+        links = [
+            PageLink(
+                text=f"PR {i}",
+                url=f"https://example.com/pr/{i}",
+                element_ref=f"e{i}",
+            )
+            for i in range(10)
+        ]
+        snapshot = _make_snapshot(links=links)
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content="[]")
+
+        result = _extract_press_releases_from_snapshot(
+            snapshot, llm, bank_name="Test Bank", page_url="https://example.com/press"
+        )
+
+        assert len(result) == 10
+
+    def test_empty_result_safety_net_skipped_for_few_links(self) -> None:
+        """When LLM returns [] and page has < 5 links, respect the empty result."""
+        links = [
+            PageLink(
+                text=f"PR {i}",
+                url=f"https://example.com/pr/{i}",
+                element_ref=f"e{i}",
+            )
+            for i in range(3)
+        ]
+        snapshot = _make_snapshot(links=links)
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content="[]")
+
+        result = _extract_press_releases_from_snapshot(
+            snapshot, llm, bank_name="Test Bank", page_url="https://example.com/press"
+        )
+
+        assert len(result) == 0

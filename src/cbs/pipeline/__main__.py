@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 import duckdb
+from dotenv import load_dotenv
 
 from cbs.config.banks import load_bank_config
 from cbs.db.run_manager import RunManager
@@ -88,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     """Run the pipeline in backfill or incremental mode."""
+    load_dotenv()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

@@ -16,7 +16,7 @@ from langchain_core.messages import (
 from langsmith import traceable
 
 from cbs.config.banks import BankConfig
-from cbs.scraper.browser import BrowserAdapter, PageSnapshot
+from cbs.scraper.browser import BrowserAdapter, BrowserNavigationError, PageSnapshot
 from cbs.scraper.models import (
     DiscoveredPressRelease,
     NavigationResult,
@@ -96,12 +96,105 @@ def _format_links_text(snapshot: PageSnapshot) -> str:
     return "\n".join(lines)
 
 
+_FILTER_LINKS_PROMPT = """\
+You are filtering links from the {bank_name} press releases listing page ({page_url}).
+Identify links that point to individual press releases, \
+news articles, announcements, or statements.
+
+Heuristics for press release links:
+- Often contain dates in the URL or text (e.g., 2024, 2023-01-15)
+- Often have descriptive titles about policy decisions, agreements, rates
+- URL paths often include: /press/, /pr/, /news/, /release/, /announcement/
+- They are the MAIN CONTENT links on a listing page
+
+Exclude ONLY links that are clearly:
+- Site navigation (Home, About, Contact, Login)
+- Footer links (Privacy, Terms, Accessibility)
+- Social media links (Twitter, Facebook, LinkedIn)
+- Category/filter links (e.g., "Filter by year", "All categories")
+- Pagination links (Next, Previous, page numbers)
+
+Err on the side of inclusion. \
+A press releases listing page typically has many press release links.
+
+Links:
+{links_text}
+
+Respond with ONLY a JSON array of element_ref strings. Example: ["e5", "e7", "e12"]
+"""
+
+
 def _extract_press_releases_from_snapshot(
     snapshot: PageSnapshot,
+    llm: BaseChatModel | None = None,
+    *,
+    bank_name: str = "",
+    page_url: str = "",
 ) -> list[DiscoveredPressRelease]:
-    """Extract all links from a snapshot as potential press releases."""
+    """Extract press release links from a snapshot.
+
+    If *llm* is provided, uses the LLM to filter out navigation/footer
+    links.  Otherwise falls back to returning all links.
+    """
+    if not snapshot.links:
+        return []
+
+    if llm is None:
+        return [
+            DiscoveredPressRelease(url=link.url, title=link.text)
+            for link in snapshot.links
+        ]
+
+    links_text = "\n".join(
+        f"[{link.element_ref}] {link.text} → {link.url}" for link in snapshot.links
+    )
+    prompt = _FILTER_LINKS_PROMPT.format(
+        bank_name=bank_name,
+        page_url=page_url,
+        links_text=links_text,
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else ""
+        content = content.strip()
+        if not content:
+            raise ValueError("Empty LLM response")
+        # Strip markdown code fences if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content
+        if content.endswith("```"):
+            content = content.rsplit("```", 1)[0].strip()
+        pr_refs: list[str] = json.loads(content)
+        if not isinstance(pr_refs, list):
+            raise ValueError("Expected list")
+    except Exception:
+        logger.warning("Failed to filter links via LLM, using all links")
+        return [
+            DiscoveredPressRelease(url=link.url, title=link.text)
+            for link in snapshot.links
+        ]
+
+    # Safety net: a listing page with many links but 0 press releases
+    # is almost certainly a filtering failure — return all links and let
+    # the downstream classifier handle false positives.
+    if len(pr_refs) == 0 and len(snapshot.links) >= 5:
+        logger.warning(
+            "LLM returned 0 press releases from %d links on %s — "
+            "falling back to all links",
+            len(snapshot.links),
+            page_url,
+        )
+        return [
+            DiscoveredPressRelease(url=link.url, title=link.text)
+            for link in snapshot.links
+        ]
+
+    ref_set = set(pr_refs)
     return [
-        DiscoveredPressRelease(url=link.url, title=link.text) for link in snapshot.links
+        DiscoveredPressRelease(url=link.url, title=link.text)
+        for link in snapshot.links
+        if link.element_ref in ref_set
     ]
 
 
@@ -169,7 +262,12 @@ def _paginate(
         if next_ref is None:
             break
 
-        current_snapshot = browser.click(next_ref, timeout=bank.page_load_timeout)
+        try:
+            current_snapshot = browser.click(next_ref, timeout=bank.page_load_timeout)
+        except BrowserNavigationError:
+            logger.warning("Pagination click failed for ref %s — stopping", next_ref)
+            break
+
         step = NavigationStep(
             step_number=len(steps) + 1,
             action="paginate",
@@ -180,7 +278,13 @@ def _paginate(
         steps.append(step)
         _log_step(step)
 
-        all_releases.extend(_extract_press_releases_from_snapshot(current_snapshot))
+        new_prs = _extract_press_releases_from_snapshot(
+            current_snapshot,
+            llm,
+            bank_name=bank.name,
+            page_url=current_snapshot.url,
+        )
+        all_releases.extend(new_prs)
 
     return all_releases
 
@@ -334,7 +438,12 @@ def _run_discovery_agent(
 
     # Extract press releases from the final page the agent landed on
     final_snapshot = browser.get_snapshot()
-    return _extract_press_releases_from_snapshot(final_snapshot)
+    return _extract_press_releases_from_snapshot(
+        final_snapshot,
+        llm,
+        bank_name=bank.name,
+        page_url=final_snapshot.url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +501,12 @@ def find_press_releases(
         steps.append(step)
         _log_step(step)
 
-        press_releases = _extract_press_releases_from_snapshot(snapshot)
+        press_releases = _extract_press_releases_from_snapshot(
+            snapshot,
+            llm,
+            bank_name=bank.name,
+            page_url=str(bank.press_releases_url),
+        )
 
         # Paginate for more releases
         if max_pages > 1:

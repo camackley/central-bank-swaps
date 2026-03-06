@@ -79,7 +79,16 @@ class BackfillOrchestrator:
             self._run_manager.set_bank_status(run_id, bank_config.name, "in_progress")
             logger.info("Processing bank: %s", bank_config.name)
 
-            result = self._processor.process_bank(bank_config)
+            try:
+                result = self._processor.process_bank(bank_config)
+            except Exception as exc:
+                error_msg = f"Unhandled error processing {bank_config.name}: {exc}"
+                logger.exception(error_msg)
+                self._run_manager.set_bank_status(
+                    run_id, bank_config.name, "failed", error_message=error_msg
+                )
+                summary.errors.append(error_msg)
+                continue
 
             if result.errors:
                 error_msg = "; ".join(result.errors)

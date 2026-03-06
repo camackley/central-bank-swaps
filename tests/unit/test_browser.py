@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import Mock
 
@@ -24,18 +25,32 @@ from cbs.scraper.browser import (
 # Helpers — build canned PinchTab HTTP responses
 # ---------------------------------------------------------------------------
 
-_INSTANCE_ID = "inst_test123"
-_TAB_ID = "tab_abc456"
 _PAGE_URL = "https://example.com"
 _PAGE_TITLE = "Example Domain"
 _PAGE_TEXT = "This is example page text content."
-_PAGE_SNAPSHOT = '<div ref="e1">Example Domain</div>'
+_PAGE_SNAPSHOT_NODES = [
+    {
+        "ref": "e0",
+        "role": "RootWebArea",
+        "name": "Example Domain",
+        "depth": 0,
+        "nodeId": 1,
+    },
+    {"ref": "e1", "role": "link", "name": "Page 1", "depth": 1, "nodeId": 2},
+    {"ref": "e2", "role": "link", "name": "Page 2", "depth": 1, "nodeId": 3},
+]
+_DOM_LINKS = [
+    {"t": "Page 1", "h": "https://example.com/page1"},
+    {"t": "Page 2", "h": "https://example.com/page2"},
+]
 
 
 _FAKE_REQUEST = httpx.Request("GET", "http://localhost:9867")
 
 
-def _json_response(data: dict[str, Any], status_code: int = 200) -> httpx.Response:
+def _json_response(
+    data: dict[str, Any] | list[Any], status_code: int = 200
+) -> httpx.Response:
     """Build an httpx.Response with JSON body."""
     return httpx.Response(status_code=status_code, json=data, request=_FAKE_REQUEST)
 
@@ -51,7 +66,7 @@ def _error_response(status_code: int = 500) -> httpx.Response:
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# BrowserClient fixtures and routes
 # ---------------------------------------------------------------------------
 
 
@@ -59,22 +74,23 @@ def _route_default(method: str, url: str, **kwargs: Any) -> httpx.Response:
     """Route mock HTTP calls to canned PinchTab responses."""
     path = url.replace("http://localhost:9867", "")
 
-    if method == "post" and path == "/instances/start":
-        return _json_response({"id": _INSTANCE_ID})
-    if method == "post" and path == f"/instances/{_INSTANCE_ID}/tabs/open":
+    if method == "get" and path == "/health":
+        return _json_response({"status": "ok", "cdp": "", "tabs": 1})
+    if method == "post" and path == "/navigate":
+        return _json_response({"url": _PAGE_URL, "title": _PAGE_TITLE})
+    if method == "get" and path == "/text":
         return _json_response(
-            {"tabId": _TAB_ID, "url": _PAGE_URL, "title": _PAGE_TITLE}
+            {"text": _PAGE_TEXT, "title": _PAGE_TITLE, "url": _PAGE_URL}
         )
-    if method == "post" and path == f"/tabs/{_TAB_ID}/navigate":
-        return _json_response({})
-    if method == "get" and path == f"/tabs/{_TAB_ID}/text":
-        return _text_response(_PAGE_TEXT)
-    if method == "get" and path == f"/tabs/{_TAB_ID}/snapshot":
-        return _text_response(_PAGE_SNAPSHOT)
-    if method == "post" and path == f"/tabs/{_TAB_ID}/close":
-        return _json_response({})
-    if method == "post" and path == f"/instances/{_INSTANCE_ID}/stop":
-        return _json_response({})
+    if method == "get" and path == "/snapshot":
+        return _json_response(
+            {
+                "count": len(_PAGE_SNAPSHOT_NODES),
+                "nodes": _PAGE_SNAPSHOT_NODES,
+                "title": _PAGE_TITLE,
+                "url": _PAGE_URL,
+            }
+        )
 
     msg = f"Unexpected {method.upper()} {path}"
     raise AssertionError(msg)
@@ -124,46 +140,7 @@ class TestNavigateToUrlReturnsContent:
         assert result.url == _PAGE_URL
         assert result.title == _PAGE_TITLE
         assert result.text == _PAGE_TEXT
-        assert result.snapshot == _PAGE_SNAPSHOT
-
-    def test_navigate_closes_tab_after_success(
-        self, browser: BrowserClient, mock_http: Mock
-    ) -> None:
-        browser.navigate(_PAGE_URL)
-
-        close_calls = [
-            c
-            for c in mock_http.post.call_args_list
-            if f"/tabs/{_TAB_ID}/close" in str(c)
-        ]
-        assert len(close_calls) == 1
-
-    def test_navigate_closes_tab_on_error(self, mock_http: Mock) -> None:
-        """Tab is closed even when text retrieval fails mid-navigation."""
-
-        def failing_get(url: str, **kwargs: Any) -> httpx.Response:
-            if "/text" in url:
-                resp = _error_response(500)
-                raise httpx.HTTPStatusError(
-                    "Server Error", request=resp.request, response=resp
-                )
-            return _route_default("get", url, **kwargs)
-
-        mock_http.get = Mock(side_effect=failing_get)
-
-        b = BrowserClient(_http_client=mock_http)
-        b.start()
-
-        with pytest.raises(BrowserNavigationError):
-            b.navigate(_PAGE_URL)
-
-        # Tab close must still have been called
-        close_calls = [
-            c
-            for c in mock_http.post.call_args_list
-            if f"/tabs/{_TAB_ID}/close" in str(c)
-        ]
-        assert len(close_calls) == 1
+        assert "nodes" in result.snapshot
 
     def test_navigate_passes_block_images(
         self, browser: BrowserClient, mock_http: Mock
@@ -222,7 +199,7 @@ class TestPageLoadWaitsForRender:
     """navigate() fetches content only after PinchTab navigation completes."""
 
     def test_text_retrieved_after_navigation_completes(self, mock_http: Mock) -> None:
-        """Call order: tabs/open -> navigate -> text -> snapshot -> close."""
+        """Call order: navigate -> text -> snapshot."""
         call_log: list[str] = []
 
         def tracking_post(url: str, **kwargs: Any) -> httpx.Response:
@@ -242,8 +219,8 @@ class TestPageLoadWaitsForRender:
         b.start()
         b.navigate(_PAGE_URL)
 
-        # Filter to only the navigate-related calls (skip start)
-        nav_calls = [c for c in call_log if "/instances/start" not in c]
+        # Filter to only the navigate-related calls (skip health check)
+        nav_calls = [c for c in call_log if "/health" not in c]
 
         # navigate must come before text and snapshot
         navigate_idx = next(i for i, c in enumerate(nav_calls) if "/navigate" in c)
@@ -266,22 +243,17 @@ class TestPageLoadWaitsForRender:
 
 
 class TestBrowserClientLifecycle:
-    """BrowserClient manages Chrome instance lifecycle correctly."""
+    """BrowserClient manages lifecycle correctly."""
 
     def test_context_manager_starts_and_stops(self, mock_http: Mock) -> None:
         with BrowserClient(_http_client=mock_http) as b:
-            assert b._instance_id is not None
+            assert b._started is True
 
-        # stop was called
-        stop_calls = [c for c in mock_http.post.call_args_list if "/stop" in str(c)]
-        assert len(stop_calls) == 1
+        assert b._started is False
 
     def test_stop_called_on_exception(self, mock_http: Mock) -> None:
         with pytest.raises(RuntimeError), BrowserClient(_http_client=mock_http):
             raise RuntimeError("something broke")
-
-        stop_calls = [c for c in mock_http.post.call_args_list if "/stop" in str(c)]
-        assert len(stop_calls) == 1
 
     def test_navigate_without_start_raises(self, mock_http: Mock) -> None:
         b = BrowserClient(_http_client=mock_http)
@@ -300,7 +272,7 @@ class TestBrowserConnectionErrors:
     """Connection failures raise the correct BrowserError subclasses."""
 
     def test_unreachable_server_raises_connection_error(self, mock_http: Mock) -> None:
-        mock_http.post = Mock(side_effect=httpx.ConnectError("Connection refused"))
+        mock_http.get = Mock(side_effect=httpx.ConnectError("Connection refused"))
 
         b = BrowserClient(_http_client=mock_http)
 
@@ -331,40 +303,43 @@ class TestBrowserConnectionErrors:
 # BrowserAdapter tests (Slice 1.13)
 # ===========================================================================
 
-_ADAPTER_SNAPSHOT = (
-    '<a ref="e0" href="https://example.com/page1">Page 1</a>'
-    '<a ref="e1" href="https://example.com/page2">Page 2</a>'
-    '<a href="https://example.com/no-ref">No Ref Link</a>'
-    '<span ref="e3">Not a link</span>'
-)
-
-_ADAPTER_SNAPSHOT_AFTER_CLICK = (
-    '<a ref="e5" href="https://example.com/clicked">Clicked Page</a>'
-)
+_ADAPTER_SNAPSHOT_NODES = [
+    {"ref": "e0", "role": "link", "name": "Page 1", "depth": 1, "nodeId": 2},
+    {"ref": "e1", "role": "link", "name": "Page 2", "depth": 1, "nodeId": 3},
+    {"ref": "e3", "role": "heading", "name": "Not a link", "depth": 1, "nodeId": 4},
+]
+_ADAPTER_DOM_LINKS = [
+    {"t": "Page 1", "h": "https://example.com/page1"},
+    {"t": "Page 2", "h": "https://example.com/page2"},
+    {"t": "No Ref Link", "h": "https://example.com/no-ref"},
+]
 
 
 def _adapter_route(method: str, url: str, **kwargs: Any) -> httpx.Response:
     """Route mock HTTP calls for BrowserAdapter tests."""
     path = url.replace("http://localhost:9867", "")
 
-    if method == "post" and path == "/instances/start":
-        return _json_response({"id": _INSTANCE_ID})
-    if method == "post" and path == f"/instances/{_INSTANCE_ID}/tabs/open":
+    if method == "get" and path == "/health":
+        return _json_response({"status": "ok", "cdp": "", "tabs": 1})
+    if method == "post" and path == "/navigate":
+        return _json_response({"url": _PAGE_URL, "title": _PAGE_TITLE})
+    if method == "get" and path == "/text":
         return _json_response(
-            {"tabId": _TAB_ID, "url": _PAGE_URL, "title": _PAGE_TITLE}
+            {"text": _PAGE_TEXT, "title": _PAGE_TITLE, "url": _PAGE_URL}
         )
-    if method == "post" and path == f"/tabs/{_TAB_ID}/navigate":
-        return _json_response({})
-    if method == "get" and path == f"/tabs/{_TAB_ID}/text":
-        return _text_response(_PAGE_TEXT)
-    if method == "get" and path == f"/tabs/{_TAB_ID}/snapshot":
-        return _text_response(_ADAPTER_SNAPSHOT)
-    if method == "post" and path == f"/tabs/{_TAB_ID}/action":
-        return _json_response({})
-    if method == "post" and path == f"/tabs/{_TAB_ID}/close":
-        return _json_response({})
-    if method == "post" and path == f"/instances/{_INSTANCE_ID}/stop":
-        return _json_response({})
+    if method == "get" and path == "/snapshot":
+        return _json_response(
+            {
+                "count": len(_ADAPTER_SNAPSHOT_NODES),
+                "nodes": _ADAPTER_SNAPSHOT_NODES,
+                "title": _PAGE_TITLE,
+                "url": _PAGE_URL,
+            }
+        )
+    if method == "post" and path == "/evaluate":
+        return _json_response({"result": json.dumps(_ADAPTER_DOM_LINKS)})
+    if method == "post" and path == "/action":
+        return _json_response({"clicked": True})
 
     msg = f"Unexpected {method.upper()} {path}"
     raise AssertionError(msg)
@@ -403,42 +378,29 @@ class TestBrowserAdapterNavigate:
             text="Page 1", url="https://example.com/page1", element_ref="e0"
         )
 
-    def test_navigate_starts_instance_on_first_call(
+    def test_navigate_checks_health_on_first_call(
         self, adapter: BrowserAdapter, adapter_http: Mock
     ) -> None:
         adapter.navigate(_PAGE_URL)
 
-        start_calls = [
-            c for c in adapter_http.post.call_args_list if "/instances/start" in str(c)
+        health_calls = [
+            c for c in adapter_http.get.call_args_list if "/health" in str(c)
         ]
-        assert len(start_calls) == 1
+        assert len(health_calls) == 1
 
-    def test_navigate_reuses_instance_on_second_call(
+    def test_navigate_reuses_connection_on_second_call(
         self, adapter: BrowserAdapter, adapter_http: Mock
     ) -> None:
         adapter.navigate(_PAGE_URL)
         adapter.navigate(_PAGE_URL)
 
-        start_calls = [
-            c for c in adapter_http.post.call_args_list if "/instances/start" in str(c)
+        health_calls = [
+            c for c in adapter_http.get.call_args_list if "/health" in str(c)
         ]
-        assert len(start_calls) == 1
-
-    def test_navigate_closes_old_tab_before_opening_new(
-        self, adapter: BrowserAdapter, adapter_http: Mock
-    ) -> None:
-        adapter.navigate(_PAGE_URL)
-        adapter_http.post.reset_mock()
-        adapter.navigate(_PAGE_URL)
-
-        call_paths = [str(c) for c in adapter_http.post.call_args_list]
-        close_calls = [c for c in call_paths if "/close" in c]
-        open_calls = [c for c in call_paths if "/tabs/open" in c]
-        assert len(close_calls) == 1
-        assert len(open_calls) == 1
+        assert len(health_calls) == 1
 
     def test_navigate_connection_error(self, adapter_http: Mock) -> None:
-        adapter_http.post = Mock(side_effect=httpx.ConnectError("Connection refused"))
+        adapter_http.get = Mock(side_effect=httpx.ConnectError("Connection refused"))
         adapter = BrowserAdapter(_http_client=adapter_http)
 
         with pytest.raises(BrowserConnectionError):
@@ -504,16 +466,14 @@ class TestBrowserAdapterGetSnapshot:
 class TestBrowserAdapterLifecycle:
     """BrowserAdapter lifecycle management."""
 
-    def test_close_session_stops_instance(
+    def test_close_session_resets_state(
         self, adapter: BrowserAdapter, adapter_http: Mock
     ) -> None:
         adapter.navigate(_PAGE_URL)
         adapter.close_session()
 
-        stop_calls = [c for c in adapter_http.post.call_args_list if "/stop" in str(c)]
-        assert len(stop_calls) == 1
-        assert adapter._instance_id is None
-        assert adapter._tab_id is None
+        assert adapter._active is False
+        assert adapter._current_url == ""
 
     def test_close_session_idempotent(self, adapter: BrowserAdapter) -> None:
         adapter.close_session()
@@ -523,27 +483,33 @@ class TestBrowserAdapterLifecycle:
         with BrowserAdapter(_http_client=adapter_http) as a:
             a.navigate(_PAGE_URL)
 
-        stop_calls = [c for c in adapter_http.post.call_args_list if "/stop" in str(c)]
-        assert len(stop_calls) == 1
+        assert a._active is False
 
 
-class TestParseLinks:
-    """BrowserAdapter._parse_links() extracts anchors with ref attributes."""
+class TestExtractLinks:
+    """BrowserAdapter._extract_links() extracts links from snapshot + evaluate."""
 
-    def test_parse_links_extracts_anchors_with_ref(self) -> None:
+    def test_extract_links_matches_by_text(self) -> None:
         adapter = BrowserAdapter()
-        html = (
-            '<a ref="e0" href="https://example.com/a">Link A</a>'
-            '<a ref="e1" href="https://example.com/b">Link B</a>'
-            '<a href="https://example.com/c">No Ref</a>'
-            '<span ref="e2">Not a link</span>'
-        )
-        links = adapter._parse_links(html)
+        adapter._http_client = _make_adapter_mock()
+        snap_data = {
+            "nodes": _ADAPTER_SNAPSHOT_NODES,
+            "title": _PAGE_TITLE,
+            "url": _PAGE_URL,
+        }
+        links = adapter._extract_links(snap_data)
 
         assert len(links) == 2
         assert links[0] == PageLink(
-            text="Link A", url="https://example.com/a", element_ref="e0"
+            text="Page 1", url="https://example.com/page1", element_ref="e0"
         )
         assert links[1] == PageLink(
-            text="Link B", url="https://example.com/b", element_ref="e1"
+            text="Page 2", url="https://example.com/page2", element_ref="e1"
         )
+
+    def test_extract_links_empty_when_no_link_nodes(self) -> None:
+        adapter = BrowserAdapter()
+        snap_data = {"nodes": [{"ref": "e0", "role": "heading", "name": "Title"}]}
+        links = adapter._extract_links(snap_data)
+
+        assert links == []

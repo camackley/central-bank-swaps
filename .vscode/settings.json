@@ -1,5 +1,10 @@
 {
   "cSpell.words": [
     "Agentic"
-  ]
+  ],
+  "workbench.editorAssociations": {
+    "*.parquet": "duckdb.dataFileViewer",
+    "*.csv": "duckdb.dataFileViewer",
+    "*.tsv": "duckdb.dataFileViewer"
+  }
 }
