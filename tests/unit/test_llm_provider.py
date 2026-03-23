@@ -6,6 +6,7 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from cbs.llm import LLMConfigError, get_llm
+from cbs.llm.claude_code_model import ClaudeCodeChatModel
 
 
 class TestGetLlmReturnsBaseChatModel:
@@ -58,3 +59,32 @@ class TestMissingApiKeyRaisesClearError:
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         with pytest.raises(LLMConfigError, match="GOOGLE_API_KEY"):
             get_llm("google-genai", "gemini-2.0-flash")
+
+
+# ---------------------------------------------------------------------------
+# TestClaudeCodeProvider
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeCodeProvider:
+    """get_llm('claude-code', ...) returns a ClaudeCodeChatModel."""
+
+    def test_get_llm_claude_code_returns_claude_code_model(self) -> None:
+        llm = get_llm("claude-code", "claude-sonnet-4-6")
+        assert isinstance(llm, ClaudeCodeChatModel)
+
+    def test_get_llm_claude_code_is_base_chat_model(self) -> None:
+        llm = get_llm("claude-code", "claude-sonnet-4-6")
+        assert isinstance(llm, BaseChatModel)
+
+    def test_get_llm_claude_code_uses_given_model_name(self) -> None:
+        llm = get_llm("claude-code", "claude-haiku-4-5")
+        assert isinstance(llm, ClaudeCodeChatModel)
+        assert llm.model_name == "claude-haiku-4-5"
+
+    def test_get_llm_claude_code_requires_no_env_vars(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        llm = get_llm("claude-code", "claude-sonnet-4-6")
+        assert isinstance(llm, ClaudeCodeChatModel)

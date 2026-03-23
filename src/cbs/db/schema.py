@@ -91,6 +91,21 @@ _ALL_DDL = [
 
 
 def init_db(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create all tables. Safe to call multiple times (IF NOT EXISTS)."""
+    """Create all tables in the active schema. Safe to call multiple times."""
     for ddl in _ALL_DDL:
         conn.execute(ddl)
+
+
+_RUNS_CATALOG_DDL = """
+CREATE TABLE IF NOT EXISTS main.runs (
+    id UUID PRIMARY KEY,
+    schema_name VARCHAR UNIQUE,
+    run_type VARCHAR,
+    created_at TIMESTAMP DEFAULT current_timestamp
+);
+"""
+
+
+def init_main(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the global runs catalog in the main schema. Idempotent."""
+    conn.execute(_RUNS_CATALOG_DDL)

@@ -32,7 +32,6 @@ class PipelineResult:
     press_release_id: uuid.UUID | None = None
     swap_ids: list[uuid.UUID] = field(default_factory=list)
     skipped_duplicate: bool = False
-    skipped_not_swap: bool = False
 
 
 class Orchestrator:
@@ -40,11 +39,10 @@ class Orchestrator:
 
     Stages:
     1. Deduplication (URL-based)
-    2. Insert press release
-    3. Detect language + translate to English
-    4. Classify as swap-related or not
-    5. If swap-related: extract structured swap data
-    6. Store swap rows + mark press release as processed
+    2. Detect language + translate to English
+    3. Classify as swap-related or not
+    4. Insert press release (always, with is_swap_related flag)
+    5. If swap-related: extract structured swap data + store swap rows
     """
 
     def __init__(
@@ -94,80 +92,61 @@ class Orchestrator:
             logger.info("Skipping duplicate URL: %s", url)
             return PipelineResult(skipped_duplicate=True)
 
-        # 2. Insert press release
-        pr = PressRelease(
-            central_bank_name=bank_name,
-            country=country,
-            url=url,
-            title=extract_result.title,
-            publication_date=extract_result.publication_date,
-            original_language=extract_result.language,
-            original_body=extract_result.body,
-            source_type=source_type,
-        )
-        pr_id = insert_press_release(self._conn, pr)
-
-        # 3. Detect language + translate
+        # 2. Detect language + translate
         lang_code = detect_language(self._translate_llm, extract_result.body)
         translation = translate_text(
             self._translate_llm, extract_result.body, original_language=lang_code
         )
         body_en = translation.body_en
 
-        # 4. Classify
+        # 3. Classify
         classification = classify_press_release(self._classify_llm, body_en)
 
-        # 5. Update press release with classification + translation results
-        self._conn.execute(
-            "UPDATE press_releases SET "
-            "body_en = ?, original_language = ?, "
-            "is_swap_related = ?, classification_reason = ?, "
-            "processed = TRUE, processed_at = current_timestamp "
-            "WHERE id = ?",
-            [
-                body_en,
-                lang_code,
-                classification.is_swap_related,
-                classification.reason,
-                str(pr_id),
-            ],
+        # 4. Insert press release — always, with is_swap_related flag set
+        pr = PressRelease(
+            central_bank_name=bank_name,
+            country=country,
+            url=url,
+            title=extract_result.title,
+            publication_date=extract_result.publication_date,
+            original_language=lang_code,
+            original_body=extract_result.body,
+            body_en=body_en,
+            is_swap_related=classification.is_swap_related,
+            classification_reason=classification.reason,
+            processed=True,
+            source_type=source_type,
         )
+        pr_id = insert_press_release(self._conn, pr)
 
-        if not classification.is_swap_related:
-            logger.info("Not swap-related: %s", url)
-            return PipelineResult(
-                press_release_id=pr_id,
-                skipped_not_swap=True,
-            )
-
-        # 6. Extract swaps and insert each direction
-        extraction = extract_swaps(self._extract_llm, body_en)
+        # 5. Extract swaps only if swap-related
         swap_ids: list[uuid.UUID] = []
-
-        for swap_record in extraction.swaps:
-            for direction in swap_record.directions:
-                swap_create = SwapCreate(
-                    press_release_id=pr_id,
-                    provider_central_bank=direction.provider_central_bank,
-                    provider_country=direction.provider_country,
-                    receiver_central_bank=direction.receiver_central_bank,
-                    receiver_country=direction.receiver_country,
-                    currency=direction.currency,
-                    swap_amount=direction.swap_amount,
-                    swap_type=swap_record.swap_type,
-                    announcement_type=swap_record.announcement_type,
-                    type_of_change=swap_record.type_of_change,
-                    conditions=swap_record.conditions,
-                    reasons_for_swap=swap_record.reasons_for_swap,
-                    announcement_date=_parse_date(swap_record.announcement_date),
-                    effective_date=_parse_date(swap_record.effective_date),
-                    maturity_date=_parse_date(swap_record.maturity_date),
-                    maturity_text=swap_record.maturity_text,
-                    duration_description=swap_record.duration_description,
-                    raw_extract=swap_record.raw_extract,
-                )
-                swap_row = insert_swap(self._conn, swap_create)
-                swap_ids.append(swap_row.id)
+        if classification.is_swap_related:
+            extraction = extract_swaps(self._extract_llm, body_en)
+            for swap_record in extraction.swaps:
+                for direction in swap_record.directions:
+                    swap_create = SwapCreate(
+                        press_release_id=pr_id,
+                        provider_central_bank=direction.provider_central_bank,
+                        provider_country=direction.provider_country,
+                        receiver_central_bank=direction.receiver_central_bank,
+                        receiver_country=direction.receiver_country,
+                        currency=direction.currency,
+                        swap_amount=direction.swap_amount,
+                        swap_type=swap_record.swap_type,
+                        announcement_type=swap_record.announcement_type,
+                        type_of_change=swap_record.type_of_change,
+                        conditions=swap_record.conditions,
+                        reasons_for_swap=swap_record.reasons_for_swap,
+                        announcement_date=_parse_date(swap_record.announcement_date),
+                        effective_date=_parse_date(swap_record.effective_date),
+                        maturity_date=_parse_date(swap_record.maturity_date),
+                        maturity_text=swap_record.maturity_text,
+                        duration_description=swap_record.duration_description,
+                        raw_extract=swap_record.raw_extract,
+                    )
+                    swap_row = insert_swap(self._conn, swap_create)
+                    swap_ids.append(swap_row.id)
 
         logger.info("Processed %s: %d swap rows created", url, len(swap_ids))
         return PipelineResult(press_release_id=pr_id, swap_ids=swap_ids)

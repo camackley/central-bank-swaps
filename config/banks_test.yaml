@@ -1,0 +1,19 @@
+banks:
+  - name: Bank of England
+    country: UK
+    homepage_url: https://www.bankofengland.co.uk
+    press_releases_url: https://www.bankofengland.co.uk/news
+    page_load_timeout: 60
+    wait_strategy: networkidle
+
+  - name: Reserve Bank of Australia
+    country: Australia
+    homepage_url: https://www.rba.gov.au
+    press_releases_url: https://www.rba.gov.au/media-releases/
+    page_load_timeout: 60
+
+  - name: Banco de la República
+    country: Colombia
+    homepage_url: https://www.banrep.gov.co
+    press_releases_url: https://www.banrep.gov.co/es/noticias-y-publicaciones
+    page_load_timeout: 60

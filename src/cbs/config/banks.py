@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, HttpUrl
@@ -17,6 +18,12 @@ class BankConfig(BaseModel):
     press_releases_url: HttpUrl | None = None
     page_load_timeout: int = 30
     historical_cutoff_year: int = 2008
+    # Playwright wait strategy for the press-releases listing page.
+    # "networkidle" (default) waits until all React/JS fetch calls complete.
+    wait_strategy: Literal["networkidle", "domcontentloaded", "load"] = "networkidle"
+    # Optional CSS selector to wait for after the load state is reached.
+    # Use for SPAs that render content asynchronously, e.g. "article".
+    wait_for_selector: str | None = None
 
 
 class BanksConfig(BaseModel):

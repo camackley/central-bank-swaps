@@ -172,7 +172,6 @@ class TestFullPipelineForSinglePressRelease:
         assert result.press_release_id is not None
         assert len(result.swap_ids) == 2
         assert result.skipped_duplicate is False
-        assert result.skipped_not_swap is False
 
         # DB: press release inserted and marked processed
         pr = db.execute(
@@ -192,12 +191,12 @@ class TestFullPipelineForSinglePressRelease:
 
 
 # ---------------------------------------------------------------------------
-# test_pipeline_skips_non_swap_releases
+# test_pipeline_stores_non_swap_releases
 # ---------------------------------------------------------------------------
 
 
-class TestPipelineSkipsNonSwapReleases:
-    """Non-swap press release → zero swap rows, still marked processed."""
+class TestPipelineStoresNonSwapReleases:
+    """Non-swap press release → stored in DB with is_swap_related=False, no swaps."""
 
     @patch(
         f"{_PATCH_BASE}.classify_press_release",
@@ -205,7 +204,7 @@ class TestPipelineSkipsNonSwapReleases:
     )
     @patch(f"{_PATCH_BASE}.translate_text", return_value=_TRANSLATION_EN)
     @patch(f"{_PATCH_BASE}.detect_language", return_value="en")
-    def test_non_swap_produces_zero_swap_rows(
+    def test_non_swap_stored_with_flag_false(
         self,
         _mock_detect: MagicMock,
         _mock_translate: MagicMock,
@@ -219,25 +218,22 @@ class TestPipelineSkipsNonSwapReleases:
             country="US",
         )
 
+        # PR is stored even though it's not swap-related
         assert result.press_release_id is not None
         assert len(result.swap_ids) == 0
-        assert result.skipped_not_swap is True
 
-        # DB: no swaps
-        swap_count = db.execute("SELECT COUNT(*) FROM swaps").fetchone()
-        assert swap_count is not None
-        assert swap_count[0] == 0
-
-        # DB: PR is processed with is_swap_related=False
+        # DB: 1 PR stored, marked as not swap-related and processed
         pr = db.execute(
-            "SELECT processed, is_swap_related, classification_reason "
-            "FROM press_releases WHERE url = ?",
+            "SELECT is_swap_related, processed FROM press_releases WHERE url = ?",
             [_HTML_RESULT_NON_SWAP.url],
         ).fetchone()
         assert pr is not None
-        assert pr[0] is True  # processed
-        assert pr[1] is False  # is_swap_related
-        assert pr[2] is not None  # classification_reason populated
+        assert pr[0] is False  # is_swap_related
+        assert pr[1] is True  # processed
+
+        swap_count = db.execute("SELECT COUNT(*) FROM swaps").fetchone()
+        assert swap_count is not None
+        assert swap_count[0] == 0
 
 
 # ---------------------------------------------------------------------------

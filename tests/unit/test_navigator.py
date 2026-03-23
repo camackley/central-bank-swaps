@@ -1,7 +1,8 @@
-"""Tests for the agentic navigator — Slice 1.10 (FR-001)."""
+"""Tests for the agentic navigator."""
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import MagicMock
 
@@ -13,7 +14,7 @@ from cbs.config.banks import BankConfig
 from cbs.scraper.browser import BrowserAdapter, PageLink, PageSnapshot
 from cbs.scraper.models import NavigationResult
 from cbs.scraper.navigator import (
-    _extract_press_releases_from_snapshot,
+    _extract_urls_from_html,
     _filter_off_domain,
     find_press_releases,
 )
@@ -23,13 +24,20 @@ from cbs.scraper.navigator import (
 # ---------------------------------------------------------------------------
 
 
-def _make_bank(*, press_releases_url: str | None = None) -> BankConfig:
+def _make_bank(
+    *,
+    press_releases_url: str | None = None,
+    wait_strategy: str = "networkidle",
+    wait_for_selector: str | None = None,
+) -> BankConfig:
     return BankConfig(
         name="Test Bank",
         country="Testland",
         homepage_url="https://www.testbank.org",
         press_releases_url=press_releases_url,
         page_load_timeout=10,
+        wait_strategy=wait_strategy,  # type: ignore[arg-type]
+        wait_for_selector=wait_for_selector,
     )
 
 
@@ -47,314 +55,323 @@ def _make_snapshot(
     )
 
 
+def _make_browser(
+    snapshot: PageSnapshot | None = None,
+    html: str = "<html><body>Test</body></html>",
+) -> MagicMock:
+    """Build a mock BrowserAdapter with sensible defaults."""
+    browser = MagicMock(spec=BrowserAdapter)
+    browser.navigate.return_value = snapshot or _make_snapshot()
+    browser.get_snapshot.return_value = snapshot or _make_snapshot()
+    browser.get_page_html.return_value = html
+    browser.click.return_value = snapshot or _make_snapshot()
+    return browser
+
+
+def _llm_returning(urls: list[str]) -> MagicMock:
+    """LLM mock that returns the given URLs as a JSON array."""
+    llm = MagicMock()
+    llm.invoke.return_value = MagicMock(content=json.dumps(urls))
+    return llm
+
+
 # ---------------------------------------------------------------------------
-# 1. test_direct_url_skips_navigation
+# 1. Direct URL mode
 # ---------------------------------------------------------------------------
 
 
-class TestDirectUrlSkipsNavigation:
-    """When press_releases_url is configured, navigate directly — no LLM agent."""
+class TestDirectUrlMode:
+    """When press_releases_url is set, navigate directly — no LLM agent."""
 
     def test_navigates_to_configured_url(self) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = _make_snapshot(
-            url="https://www.testbank.org/press",
-            title="Press Releases",
-            links=[
-                PageLink(
-                    text="Swap agreement with ECB",
-                    url="https://www.testbank.org/pr/1",
-                    element_ref="e0",
-                ),
-            ],
-        )
-        llm = MagicMock()
+        browser = _make_browser()
+        llm = _llm_returning(["https://www.testbank.org/pr/1"])
 
-        result = find_press_releases(bank, browser, llm, max_pages=1)
+        find_press_releases(bank, browser, llm, max_pages=1)
 
         browser.navigate.assert_called_once_with(
             "https://www.testbank.org/press",
             timeout=10,
+            wait_strategy="networkidle",
+            wait_for_selector=None,
         )
-        assert result.used_direct_url is True
-        assert result.bank_name == "Test Bank"
 
-    def test_llm_not_invoked_for_direct_url(self) -> None:
-        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = _make_snapshot(links=[])
-        llm = MagicMock()
+    def test_passes_wait_strategy_to_navigate(self) -> None:
+        bank = _make_bank(
+            press_releases_url="https://www.testbank.org/press",
+            wait_strategy="domcontentloaded",
+        )
+        browser = _make_browser()
+        llm = _llm_returning([])
 
         find_press_releases(bank, browser, llm, max_pages=1)
 
-        llm.invoke.assert_not_called()
-        llm.bind_tools.assert_not_called()
-
-    def test_returns_navigation_result_with_press_releases(self) -> None:
-        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = _make_snapshot(
-            url="https://www.testbank.org/press",
-            links=[
-                PageLink(
-                    text="Swap agreement with ECB",
-                    url="https://www.testbank.org/pr/1",
-                    element_ref="e0",
-                ),
-                PageLink(
-                    text="Rate decision Dec 2023",
-                    url="https://www.testbank.org/pr/2",
-                    element_ref="e1",
-                ),
-            ],
+        browser.navigate.assert_called_once_with(
+            "https://www.testbank.org/press",
+            timeout=10,
+            wait_strategy="domcontentloaded",
+            wait_for_selector=None,
         )
-        llm = MagicMock()
+
+    def test_passes_wait_for_selector_to_navigate(self) -> None:
+        bank = _make_bank(
+            press_releases_url="https://www.testbank.org/press",
+            wait_for_selector="article",
+        )
+        browser = _make_browser()
+        llm = _llm_returning([])
+
+        find_press_releases(bank, browser, llm, max_pages=1)
+
+        browser.navigate.assert_called_once_with(
+            "https://www.testbank.org/press",
+            timeout=10,
+            wait_strategy="networkidle",
+            wait_for_selector="article",
+        )
+
+    def test_calls_get_page_html(self) -> None:
+        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
+        browser = _make_browser()
+        llm = _llm_returning([])
+
+        find_press_releases(bank, browser, llm, max_pages=1)
+
+        browser.get_page_html.assert_called()
+
+    def test_returns_urls_from_llm_extraction(self) -> None:
+        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
+        browser = _make_browser()
+        pr_url = "https://www.testbank.org/press/swap-ecb-2024"
+        llm = _llm_returning([pr_url])
 
         result = find_press_releases(bank, browser, llm, max_pages=1)
 
         assert isinstance(result, NavigationResult)
         assert result.used_direct_url is True
+        assert any(pr.url == pr_url for pr in result.press_releases)
+
+    def test_fallback_to_snapshot_links_when_llm_returns_empty(self) -> None:
+        """When LLM extraction returns [], fall back to links from snapshot."""
+        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
+        pr_link = PageLink(
+            text="Swap agreement",
+            url="https://www.testbank.org/pr/1",
+            element_ref="https://www.testbank.org/pr/1",
+        )
+        browser = _make_browser(snapshot=_make_snapshot(links=[pr_link]))
+        llm = _llm_returning([])
+
+        result = find_press_releases(bank, browser, llm, max_pages=1)
+
+        assert any(
+            pr.url == "https://www.testbank.org/pr/1" for pr in result.press_releases
+        )
+
+    def test_agent_not_invoked_for_direct_url(self) -> None:
+        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
+        browser = _make_browser()
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content="[]")
+
+        find_press_releases(bank, browser, llm, max_pages=1)
+
+        llm.bind_tools.assert_not_called()
+
+    def test_marks_result_as_direct_url(self) -> None:
+        bank = _make_bank(press_releases_url="https://www.testbank.org/press")
+        browser = _make_browser()
+        llm = _llm_returning([])
+
+        result = find_press_releases(bank, browser, llm, max_pages=1)
+
+        assert result.used_direct_url is True
+        assert result.bank_name == "Test Bank"
         assert result.listing_page_url == "https://www.testbank.org/press"
-        assert len(result.press_releases) == 2
-        assert result.press_releases[0].url == "https://www.testbank.org/pr/1"
 
 
 # ---------------------------------------------------------------------------
-# 2. test_agent_finds_press_releases_from_homepage
+# 2. HTML URL extraction
 # ---------------------------------------------------------------------------
 
 
-class TestAgentFindsPressReleasesFromHomepage:
-    """LLM agent navigates from homepage to discover press releases section."""
+class TestHtmlUrlExtraction:
+    """_extract_urls_from_html() asks the LLM to identify press release URLs."""
 
-    def test_agent_discovers_press_releases_section(self) -> None:
-        """Agent navigates: homepage → clicks 'Media' → clicks 'Press Releases'."""
-        bank = _make_bank()  # No press_releases_url
+    def test_returns_press_release_urls(self) -> None:
+        html = "<html><body><a href='/news/2024/swap'>Swap agreement</a></body></html>"
+        llm = _llm_returning(["https://example.com/news/2024/swap"])
 
-        browser = MagicMock(spec=BrowserAdapter)
-
-        homepage = _make_snapshot(
-            url="https://www.testbank.org",
-            title="Test Bank - Home",
-            links=[
-                PageLink(text="About", url="/about", element_ref="e0"),
-                PageLink(text="Media & Press", url="/media", element_ref="e1"),
-                PageLink(text="Research", url="/research", element_ref="e2"),
-            ],
-        )
-        media_page = _make_snapshot(
-            url="https://www.testbank.org/media",
-            title="Media",
-            links=[
-                PageLink(
-                    text="Press Releases",
-                    url="/media/press",
-                    element_ref="e0",
-                ),
-                PageLink(text="Speeches", url="/media/speeches", element_ref="e1"),
-            ],
-        )
-        listing_page = _make_snapshot(
-            url="https://www.testbank.org/media/press",
-            title="Press Releases",
-            links=[
-                PageLink(
-                    text="Swap agreement with ECB - Jan 2024",
-                    url="https://www.testbank.org/pr/swap-ecb-2024",
-                    element_ref="e0",
-                ),
-                PageLink(
-                    text="Interest rate decision - Dec 2023",
-                    url="https://www.testbank.org/pr/rate-dec-2023",
-                    element_ref="e1",
-                ),
-            ],
+        result = _extract_urls_from_html(
+            html, llm, bank_name="Test Bank", page_url="https://example.com/press"
         )
 
-        # navigate(homepage_url) → homepage; then clicks happen
-        browser.navigate.return_value = homepage
-        browser.click.side_effect = [media_page, listing_page]
-        browser.get_snapshot.return_value = listing_page
+        assert len(result) == 1
+        assert result[0].url == "https://example.com/news/2024/swap"
 
-        # Fake LLM that returns predetermined tool-calling messages:
-        # 1) click "Media & Press" (e1)
-        # 2) click "Press Releases" (e0)
-        # 3) extract URLs
-        # 4) final answer
-        fake_llm = FakeMessagesListChatModel(
-            responses=[
-                AIMessage(
-                    content="I see a 'Media & Press' link. Let me click it.",
-                    tool_calls=[
-                        {
-                            "id": "call_1",
-                            "name": "click_link",
-                            "args": {"element_ref": "e1"},
-                        }
-                    ],
-                ),
-                AIMessage(
-                    content="Found 'Press Releases' link. Clicking it.",
-                    tool_calls=[
-                        {
-                            "id": "call_2",
-                            "name": "click_link",
-                            "args": {"element_ref": "e0"},
-                        }
-                    ],
-                ),
-                AIMessage(
-                    content="I'm on the press releases listing. Extracting URLs.",
-                    tool_calls=[
-                        {
-                            "id": "call_3",
-                            "name": "extract_press_release_urls",
-                            "args": {},
-                        }
-                    ],
-                ),
-                AIMessage(content="Found 2 press releases on the listing page."),
-            ],
+    def test_prompt_includes_bank_name_and_page_url(self) -> None:
+        html = "<html><body></body></html>"
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content="[]")
+
+        _extract_urls_from_html(
+            html,
+            llm,
+            bank_name="Federal Reserve",
+            page_url="https://fed.gov/press",
         )
 
-        result = find_press_releases(bank, browser, fake_llm, max_pages=1)
+        prompt_text = llm.invoke.call_args[0][0][0].content
+        assert "Federal Reserve" in prompt_text
+        assert "https://fed.gov/press" in prompt_text
 
-        assert result.used_direct_url is False
-        assert len(result.press_releases) >= 1
-        assert result.pages_visited >= 1
+    def test_handles_json_with_preamble(self) -> None:
+        """Claude sometimes adds text before the JSON array — we extract it."""
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(
+            content='Here are the URLs:\n["https://example.com/pr/1"]\nDone.'
+        )
+
+        result = _extract_urls_from_html(
+            "<html/>", llm, bank_name="Bank", page_url="https://example.com"
+        )
+
+        assert len(result) == 1
+        assert result[0].url == "https://example.com/pr/1"
+
+    def test_falls_back_to_empty_on_invalid_json(self) -> None:
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content="not valid json")
+
+        result = _extract_urls_from_html(
+            "<html/>", llm, bank_name="Bank", page_url="https://example.com"
+        )
+
+        assert result == []
+
+    def test_filters_non_http_urls(self) -> None:
+        llm = _llm_returning(
+            ["https://example.com/pr/1", "ftp://files.example.com/doc.pdf", ""]
+        )
+
+        result = _extract_urls_from_html(
+            "<html/>", llm, bank_name="Bank", page_url="https://example.com"
+        )
+
+        assert len(result) == 1
+        assert result[0].url == "https://example.com/pr/1"
+
+    def test_truncates_large_html(self) -> None:
+        """HTML larger than _HTML_CHAR_LIMIT is truncated before sending."""
+        large_html = "x" * 500_000
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content="[]")
+
+        _extract_urls_from_html(
+            large_html, llm, bank_name="Bank", page_url="https://example.com"
+        )
+
+        prompt_text = llm.invoke.call_args[0][0][0].content
+        # Prompt overhead + 150K char HTML limit
+        assert len(prompt_text) < 160_000
 
 
 # ---------------------------------------------------------------------------
-# 3. test_pagination_discovers_older_releases
+# 3. Pagination
 # ---------------------------------------------------------------------------
 
 
-class TestPaginationDiscoversOlderReleases:
+class TestPagination:
     """Pagination follows 'next page' links to discover more press releases."""
 
-    def test_pagination_follows_next_page_link(self) -> None:
+    def test_pagination_navigates_to_next_page(self) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
+
+        page1_links = [
+            PageLink(
+                text="Next",
+                url="https://www.testbank.org/press?page=2",
+                element_ref="https://www.testbank.org/press?page=2",
+            ),
+        ]
+        page1 = _make_snapshot(links=page1_links)
+        page2 = _make_snapshot(url="https://www.testbank.org/press?page=2", links=[])
+
         browser = MagicMock(spec=BrowserAdapter)
-
-        page1 = _make_snapshot(
-            url="https://www.testbank.org/press",
-            links=[
-                PageLink(
-                    text="PR 1",
-                    url="https://www.testbank.org/pr/1",
-                    element_ref="e0",
-                ),
-                PageLink(
-                    text="PR 2",
-                    url="https://www.testbank.org/pr/2",
-                    element_ref="e1",
-                ),
-                PageLink(
-                    text="Next Page",
-                    url="/press?page=2",
-                    element_ref="e10",
-                ),
-            ],
-        )
-        page2 = _make_snapshot(
-            url="https://www.testbank.org/press?page=2",
-            links=[
-                PageLink(
-                    text="PR 3",
-                    url="https://www.testbank.org/pr/3",
-                    element_ref="e0",
-                ),
-                PageLink(
-                    text="PR 4",
-                    url="https://www.testbank.org/pr/4",
-                    element_ref="e1",
-                ),
-            ],
-        )
-
         browser.navigate.return_value = page1
+        browser.get_snapshot.return_value = page2
         browser.click.return_value = page2
+        browser.get_page_html.return_value = "<html/>"
 
-        # LLM responses: filter page1 links, pagination ref, filter page2, no more pages
-        fake_llm = FakeMessagesListChatModel(
+        llm = FakeMessagesListChatModel(
             responses=[
-                AIMessage(content='["e0", "e1"]'),  # filter links page 1
-                AIMessage(content='{"element_ref": "e10"}'),  # pagination
-                AIMessage(content='["e0", "e1"]'),  # filter links page 2
-                AIMessage(content="null"),  # no more pages
-            ],
+                # page 1 extraction
+                AIMessage(content='["https://www.testbank.org/pr/1"]'),
+                # pagination: LLM finds next link
+                AIMessage(
+                    content='{"element_ref": "https://www.testbank.org/press?page=2"}'
+                ),
+                # page 2 extraction
+                AIMessage(content='["https://www.testbank.org/pr/3"]'),
+                # no more pages
+                AIMessage(content="null"),
+            ]
         )
 
-        result = find_press_releases(bank, browser, fake_llm, max_pages=3)
+        result = find_press_releases(bank, browser, llm, max_pages=3)
 
         assert result.pages_visited >= 2
-        all_urls = [pr.url for pr in result.press_releases]
-        assert "https://www.testbank.org/pr/1" in all_urls
-        assert "https://www.testbank.org/pr/3" in all_urls
+        urls = [pr.url for pr in result.press_releases]
+        assert "https://www.testbank.org/pr/1" in urls
+        assert "https://www.testbank.org/pr/3" in urls
 
     def test_pagination_stops_at_max_pages(self) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-
         page = _make_snapshot(
             links=[
                 PageLink(
-                    text="PR",
-                    url="https://www.testbank.org/pr/1",
-                    element_ref="e0",
-                ),
-                PageLink(
                     text="Next",
-                    url="/press?page=2",
-                    element_ref="e10",
-                ),
-            ],
+                    url="https://www.testbank.org/press?page=2",
+                    element_ref="https://www.testbank.org/press?page=2",
+                )
+            ]
         )
-        browser.navigate.return_value = page
-        browser.click.return_value = page
+        browser = _make_browser(snapshot=page)
 
-        fake_llm = FakeMessagesListChatModel(
+        llm = FakeMessagesListChatModel(
             responses=[
-                AIMessage(content='["e0"]'),  # filter links page 1
-                AIMessage(content='{"element_ref": "e10"}'),  # pagination
-                AIMessage(content='["e0"]'),  # filter links page 2
-            ],
+                AIMessage(content="[]"),
+                AIMessage(
+                    content='{"element_ref": "https://www.testbank.org/press?page=2"}'
+                ),
+                AIMessage(content="[]"),
+            ]
         )
 
-        result = find_press_releases(bank, browser, fake_llm, max_pages=2)
+        result = find_press_releases(bank, browser, llm, max_pages=2)
 
-        # max_pages=2 means at most 2 listing pages total (initial + 1 pagination)
         assert result.pages_visited <= 2
 
     def test_pagination_stops_when_no_next_link(self) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
+        page = _make_snapshot(links=[])
+        browser = _make_browser(snapshot=page)
 
-        page = _make_snapshot(
-            links=[
-                PageLink(
-                    text="PR 1",
-                    url="https://www.testbank.org/pr/1",
-                    element_ref="e0",
-                ),
-            ],
-        )
-        browser.navigate.return_value = page
-        fake_llm = FakeMessagesListChatModel(
+        llm = FakeMessagesListChatModel(
             responses=[
-                AIMessage(content='["e0"]'),  # filter links page 1
-                AIMessage(content="null"),  # no pagination link
-            ],
+                AIMessage(content='["https://www.testbank.org/pr/1"]'),
+                AIMessage(content="null"),
+            ]
         )
 
-        result = find_press_releases(bank, browser, fake_llm, max_pages=5)
+        result = find_press_releases(bank, browser, llm, max_pages=5)
 
         assert result.pages_visited == 1
 
 
 # ---------------------------------------------------------------------------
-# 4. test_navigation_steps_logged
+# 4. Navigation steps logged
 # ---------------------------------------------------------------------------
 
 
@@ -363,9 +380,8 @@ class TestNavigationStepsLogged:
 
     def test_direct_url_logs_single_step(self) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = _make_snapshot(links=[])
-        llm = MagicMock()
+        browser = _make_browser()
+        llm = _llm_returning([])
 
         result = find_press_releases(bank, browser, llm, max_pages=1)
 
@@ -376,9 +392,8 @@ class TestNavigationStepsLogged:
 
     def test_navigation_steps_have_required_fields(self) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = _make_snapshot(links=[])
-        llm = MagicMock()
+        browser = _make_browser()
+        llm = _llm_returning([])
 
         result = find_press_releases(bank, browser, llm, max_pages=1)
 
@@ -392,9 +407,8 @@ class TestNavigationStepsLogged:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         bank = _make_bank(press_releases_url="https://www.testbank.org/press")
-        browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = _make_snapshot(links=[])
-        llm = MagicMock()
+        browser = _make_browser()
+        llm = _llm_returning([])
 
         with caplog.at_level(logging.INFO, logger="cbs.scraper.navigator"):
             find_press_releases(bank, browser, llm, max_pages=1)
@@ -403,74 +417,96 @@ class TestNavigationStepsLogged:
 
 
 # ---------------------------------------------------------------------------
-# 5. test_filter_prompt_and_safety_net
+# 5. Agent discovery mode
 # ---------------------------------------------------------------------------
 
 
-class TestFilterPromptAndSafetyNet:
-    """Filter prompt includes bank context; safety net catches empty results."""
+class TestAgentDiscovery:
+    """LLM agent navigates from homepage to discover press releases section."""
 
-    def test_filter_prompt_includes_bank_name(self) -> None:
-        """The filter prompt sent to the LLM contains the bank name."""
-        snapshot = _make_snapshot(
+    def test_agent_discovery_used_when_no_press_releases_url(self) -> None:
+        bank = _make_bank()  # no press_releases_url
+
+        pr_url = "https://www.testbank.org/media/press/swap-2024"
+        browser = MagicMock(spec=BrowserAdapter)
+        browser.navigate.return_value = _make_snapshot(
+            url="https://www.testbank.org",
             links=[
-                PageLink(text="PR 1", url="https://example.com/pr/1", element_ref="e0"),
+                PageLink(
+                    text="Media",
+                    url="https://www.testbank.org/media",
+                    element_ref="https://www.testbank.org/media",
+                )
             ],
         )
-        llm = MagicMock()
-        llm.invoke.return_value = MagicMock(content='["e0"]')
+        listing = _make_snapshot(
+            url="https://www.testbank.org/media/press",
+            links=[
+                PageLink(
+                    text="Swap 2024",
+                    url=pr_url,
+                    element_ref=pr_url,
+                )
+            ],
+        )
+        browser.click.return_value = listing
+        browser.get_snapshot.return_value = listing
+        browser.get_page_html.return_value = f"<html><a href='{pr_url}'>Swap</a></html>"
 
-        _extract_press_releases_from_snapshot(
-            snapshot, llm, bank_name="Federal Reserve", page_url="https://fed.gov/press"
+        fake_llm = FakeMessagesListChatModel(
+            responses=[
+                AIMessage(
+                    content="Clicking Media link",
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "name": "click_link",
+                            "args": {"element_ref": "https://www.testbank.org/media"},
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content="Extracting press release URLs",
+                    tool_calls=[
+                        {
+                            "id": "call_2",
+                            "name": "extract_press_release_urls",
+                            "args": {},
+                        }
+                    ],
+                ),
+                AIMessage(content="Done."),
+                # _extract_urls_from_html calls llm.invoke once more
+                AIMessage(content=f'["{pr_url}"]'),
+            ]
         )
 
-        prompt_text = llm.invoke.call_args[0][0][0].content
-        assert "Federal Reserve" in prompt_text
-        assert "https://fed.gov/press" in prompt_text
+        result = find_press_releases(bank, browser, fake_llm, max_pages=1)
 
-    def test_empty_result_safety_net_returns_all_links(self) -> None:
-        """When LLM returns [] but page has >= 5 links, fall back to all."""
-        links = [
-            PageLink(
-                text=f"PR {i}",
-                url=f"https://example.com/pr/{i}",
-                element_ref=f"e{i}",
-            )
-            for i in range(10)
-        ]
-        snapshot = _make_snapshot(links=links)
-        llm = MagicMock()
-        llm.invoke.return_value = MagicMock(content="[]")
+        assert result.used_direct_url is False
+        assert result.pages_visited >= 1
 
-        result = _extract_press_releases_from_snapshot(
-            snapshot, llm, bank_name="Test Bank", page_url="https://example.com/press"
+    def test_result_is_not_used_direct_url_for_discovery(self) -> None:
+        bank = _make_bank()
+        browser = MagicMock(spec=BrowserAdapter)
+        browser.navigate.return_value = _make_snapshot(links=[])
+        browser.get_snapshot.return_value = _make_snapshot(links=[])
+        browser.get_page_html.return_value = "<html/>"
+
+        fake_llm = FakeMessagesListChatModel(
+            responses=[
+                AIMessage(content="No press releases found."),
+                AIMessage(content="[]"),
+            ]
         )
 
-        assert len(result) == 10
+        result = find_press_releases(bank, browser, fake_llm, max_pages=1)
 
-    def test_empty_result_safety_net_skipped_for_few_links(self) -> None:
-        """When LLM returns [] and page has < 5 links, respect the empty result."""
-        links = [
-            PageLink(
-                text=f"PR {i}",
-                url=f"https://example.com/pr/{i}",
-                element_ref=f"e{i}",
-            )
-            for i in range(3)
-        ]
-        snapshot = _make_snapshot(links=links)
-        llm = MagicMock()
-        llm.invoke.return_value = MagicMock(content="[]")
-
-        result = _extract_press_releases_from_snapshot(
-            snapshot, llm, bank_name="Test Bank", page_url="https://example.com/press"
-        )
-
-        assert len(result) == 0
+        assert result.used_direct_url is False
 
 
 # ---------------------------------------------------------------------------
-# 6. test_off_domain_urls_filtered
+# 6. Off-domain URL filtering
 # ---------------------------------------------------------------------------
 
 

@@ -282,3 +282,73 @@ class TestBackfillRecordsRunSummary:
         assert summary.banks_succeeded == 1
         assert len(summary.errors) == 1
         assert "SSL certificate error" in summary.errors[0]
+
+
+# ---------------------------------------------------------------------------
+# test_backfill_parallel_mode
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillParallelMode:
+    def test_parallel_processes_all_banks(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_db(db)
+        proc1 = FakeBankProcessor()
+        proc2 = FakeBankProcessor()
+        banks = _make_banks_config(["Bank A", "Bank B", "Bank C"])
+        orch = BackfillOrchestrator(db, RunManager(db), [proc1, proc2], banks)
+
+        summary = orch.run()
+
+        all_processed = set(proc1.processed_banks + proc2.processed_banks)
+        assert all_processed == {"Bank A", "Bank B", "Bank C"}
+        assert summary.banks_succeeded == 3
+        assert summary.press_releases_found == 15  # 3 banks * 5 default
+
+    def test_parallel_handles_errors(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_db(db)
+        results = {
+            "Bad Bank": BankProcessingResult(
+                bank_name="Bad Bank",
+                press_releases_found=0,
+                errors=["Connection refused"],
+            ),
+        }
+        proc1 = FakeBankProcessor(results=results)
+        proc2 = FakeBankProcessor()
+        banks = _make_banks_config(["Bad Bank", "Good Bank"])
+        orch = BackfillOrchestrator(db, RunManager(db), [proc1, proc2], banks)
+
+        summary = orch.run()
+
+        assert summary.banks_succeeded == 1
+        assert len(summary.errors) == 1
+
+    def test_parallel_handles_exceptions(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_db(db)
+
+        class ExplodingProcessor:
+            def process_bank(self, bank: BankConfig) -> BankProcessingResult:
+                raise RuntimeError("boom")
+
+        banks = _make_banks_config(["Bank A"])
+        orch = BackfillOrchestrator(db, RunManager(db), [ExplodingProcessor()], banks)
+
+        summary = orch.run()
+
+        assert summary.banks_succeeded == 0
+        assert len(summary.errors) == 1
+        assert "boom" in summary.errors[0]
+
+    def test_single_processor_uses_sequential(
+        self, db: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A single-element list still works (uses sequential path)."""
+        init_db(db)
+        processor = FakeBankProcessor()
+        banks = _make_banks_config(["Bank A"])
+        orch = BackfillOrchestrator(db, RunManager(db), [processor], banks)
+
+        summary = orch.run()
+
+        assert summary.banks_succeeded == 1
+        assert processor.processed_banks == ["Bank A"]

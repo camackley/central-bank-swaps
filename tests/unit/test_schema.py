@@ -3,7 +3,7 @@
 import duckdb
 import pytest
 
-from cbs.db.schema import init_db
+from cbs.db.schema import init_db, init_main
 
 
 def _get_columns(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
@@ -214,6 +214,36 @@ class TestBankScrapingStatusTable:
                 "(id, run_id, central_bank_name, status) "
                 "VALUES (uuid(), uuid(), 'Test Bank', 'pending')"
             )
+
+
+class TestInitMain:
+    """init_main creates and maintains the global runs catalog."""
+
+    def test_creates_runs_table(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_main(db)
+        tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        assert "runs" in tables
+
+    def test_runs_table_columns(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_main(db)
+        columns = _get_columns(db, "runs")
+        assert "id" in columns
+        assert "schema_name" in columns
+        assert "run_type" in columns
+        assert "created_at" in columns
+
+    def test_init_main_is_idempotent(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_main(db)
+        init_main(db)  # Should not raise
+        count = db.execute("SELECT COUNT(*) FROM main.runs").fetchone()
+        assert count is not None
+        assert count[0] == 0
 
 
 class TestSchemaIdempotency:

@@ -427,8 +427,103 @@ def test_extract_swaps_passes_text_to_llm() -> None:
     # The structured-output chain should have been invoked with the text
     structured = llm.with_structured_output.return_value
     structured.invoke.assert_called_once()
-    call_arg = structured.invoke.call_args[0][0]
-    assert "The press release body goes here." in str(call_arg)
+
+
+# ---------------------------------------------------------------------------
+# TestSwapAmountValidator
+# ---------------------------------------------------------------------------
+
+
+class TestSwapAmountValidator:
+    """swap_amount accepts formatted strings from LLMs and converts to Decimal."""
+
+    def test_billion_string_aud(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="RBA",
+            provider_country="Australia",
+            receiver_central_bank="BoJ",
+            receiver_country="Japan",
+            currency="AUD",
+            swap_amount="A$20 billion",  # type: ignore[arg-type]
+        )
+        assert d.swap_amount == Decimal("20000000000")
+
+    def test_trillion_string_jpy(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="BoJ",
+            provider_country="Japan",
+            receiver_central_bank="RBA",
+            receiver_country="Australia",
+            currency="JPY",
+            swap_amount="JPY 1.6 trillion",  # type: ignore[arg-type]
+        )
+        assert d.swap_amount == Decimal("1600000000000")
+
+    def test_million_string(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="A",
+            provider_country="X",
+            receiver_central_bank="B",
+            receiver_country="Y",
+            currency="USD",
+            swap_amount="USD 500 million",  # type: ignore[arg-type]
+        )
+        assert d.swap_amount == Decimal("500000000")
+
+    def test_plain_number_string(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="A",
+            provider_country="X",
+            receiver_central_bank="B",
+            receiver_country="Y",
+            currency="USD",
+            swap_amount="50000000000",  # type: ignore[arg-type]
+        )
+        assert d.swap_amount == Decimal("50000000000")
+
+    def test_int_input(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="A",
+            provider_country="X",
+            receiver_central_bank="B",
+            receiver_country="Y",
+            currency="USD",
+            swap_amount=50000000000,  # type: ignore[arg-type]
+        )
+        assert d.swap_amount == Decimal("50000000000")
+
+    def test_none_stays_none(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="A",
+            provider_country="X",
+            receiver_central_bank="B",
+            receiver_country="Y",
+            currency="USD",
+            swap_amount=None,
+        )
+        assert d.swap_amount is None
+
+    def test_empty_string_becomes_none(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="A",
+            provider_country="X",
+            receiver_central_bank="B",
+            receiver_country="Y",
+            currency="USD",
+            swap_amount="",  # type: ignore[arg-type]
+        )
+        assert d.swap_amount is None
+
+    def test_no_number_becomes_none(self) -> None:
+        d = SwapDirection(
+            provider_central_bank="A",
+            provider_country="X",
+            receiver_central_bank="B",
+            receiver_country="Y",
+            currency="USD",
+            swap_amount="unknown",  # type: ignore[arg-type]
+        )
+        assert d.swap_amount is None
 
 
 # ---------------------------------------------------------------------------

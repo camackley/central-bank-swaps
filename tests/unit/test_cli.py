@@ -15,8 +15,9 @@ class TestDefaultArgsParse:
         assert args.config == "config/banks.yaml"
         assert args.db == "central_bank_swaps.duckdb"
         assert args.provider == "anthropic"
-        assert args.model == "claude-sonnet-4-20250514"
+        assert args.model == "claude-sonnet-4-6"
         assert args.max_pages == 5
+        assert args.banks is None
         assert args.resume is None
         assert args.mode == "backfill"
 
@@ -58,6 +59,23 @@ class TestModelTieringFlags:
         args = parser.parse_args([])
         assert args.classify_model is None
         assert args.extract_model is None
+
+
+class TestBanksFilter:
+    def test_banks_flag_accepted(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--banks", "banrep", "australia"])
+        assert args.banks == ["banrep", "australia"]
+
+    def test_banks_multiple_values(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--banks", "japan", "china", "fed"])
+        assert args.banks == ["japan", "china", "fed"]
+
+    def test_banks_default_is_none(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([])
+        assert args.banks is None
 
 
 class TestModuleImportable:

@@ -27,6 +27,7 @@ banks:
     homepage_url: https://www.bankofengland.co.uk
     press_releases_url: https://www.bankofengland.co.uk/news
     page_load_timeout: 60
+    wait_strategy: networkidle
 
   - name: Swiss National Bank
     country: Switzerland

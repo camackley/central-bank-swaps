@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from langsmith import traceable
 
 from cbs.config.banks import BankConfig, BanksConfig
-from cbs.db.run_manager import RunManager
+from cbs.db.run_manager import BankStatus, RunManager
 from cbs.db.schema import TABLE_SCRAPING_RUNS
-from cbs.pipeline.models import RunSummary
+from cbs.pipeline.models import BankProcessingResult, RunSummary
 
 if TYPE_CHECKING:
     import duckdb
@@ -33,12 +35,15 @@ class IncrementalOrchestrator:
         self,
         conn: duckdb.DuckDBPyConnection,
         run_manager: RunManager,
-        bank_processor: BankProcessor,
+        bank_processor: BankProcessor | Sequence[BankProcessor],
         banks_config: BanksConfig,
     ) -> None:
         self._conn = conn
         self._run_manager = run_manager
-        self._processor = bank_processor
+        if isinstance(bank_processor, Sequence):
+            self._processors = list(bank_processor)
+        else:
+            self._processors = [bank_processor]
         self._banks_config = banks_config
 
     @traceable(name="incremental_run", run_type="chain")
@@ -70,48 +75,10 @@ class IncrementalOrchestrator:
 
         summary = RunSummary(banks_attempted=len(bank_names))
 
-        for bank_status in banks_to_process:
-            bank_config = bank_lookup.get(bank_status.central_bank_name)
-            if bank_config is None:
-                logger.warning(
-                    "Bank '%s' in run but not in config — skipping",
-                    bank_status.central_bank_name,
-                )
-                continue
-
-            self._run_manager.set_bank_status(run_id, bank_config.name, "in_progress")
-            logger.info("Processing bank: %s", bank_config.name)
-
-            result = self._processor.process_bank(bank_config)
-
-            if result.errors:
-                error_msg = "; ".join(result.errors)
-                self._run_manager.set_bank_status(
-                    run_id,
-                    bank_config.name,
-                    "failed",
-                    error_message=error_msg,
-                )
-                summary.errors.extend(result.errors)
-                logger.error("Bank %s failed: %s", bank_config.name, error_msg)
-            else:
-                self._run_manager.set_bank_status(
-                    run_id,
-                    bank_config.name,
-                    "completed",
-                    press_releases_found=result.press_releases_found,
-                )
-                summary.banks_succeeded += 1
-                logger.info(
-                    "Bank %s completed: %d new, %d skipped, %d swaps",
-                    bank_config.name,
-                    result.press_releases_found,
-                    result.skipped_duplicates,
-                    result.swaps_extracted,
-                )
-
-            summary.press_releases_found += result.press_releases_found
-            summary.swaps_extracted += result.swaps_extracted
+        if len(self._processors) == 1:
+            self._run_sequential(run_id, banks_to_process, bank_lookup, summary)
+        else:
+            self._run_parallel(run_id, banks_to_process, bank_lookup, summary)
 
         # Finalize the run record
         errors_json = json.dumps(summary.errors) if summary.errors else None
@@ -141,3 +108,107 @@ class IncrementalOrchestrator:
         )
 
         return summary
+
+    def _run_sequential(
+        self,
+        run_id: UUID,
+        banks_to_process: list[BankStatus],
+        bank_lookup: dict[str, BankConfig],
+        summary: RunSummary,
+    ) -> None:
+        processor = self._processors[0]
+        for bank_status in banks_to_process:
+            bank_config = bank_lookup.get(bank_status.central_bank_name)
+            if bank_config is None:
+                logger.warning(
+                    "Bank '%s' in run but not in config — skipping",
+                    bank_status.central_bank_name,
+                )
+                continue
+
+            self._run_manager.set_bank_status(run_id, bank_config.name, "in_progress")
+            logger.info("Processing bank: %s", bank_config.name)
+
+            result = processor.process_bank(bank_config)
+
+            self._handle_result(run_id, bank_config, result, summary)
+
+    def _run_parallel(
+        self,
+        run_id: UUID,
+        banks_to_process: list[BankStatus],
+        bank_lookup: dict[str, BankConfig],
+        summary: RunSummary,
+    ) -> None:
+        with ThreadPoolExecutor(max_workers=len(self._processors)) as executor:
+            futures = {}
+            for i, bank_status in enumerate(banks_to_process):
+                bank_config = bank_lookup.get(bank_status.central_bank_name)
+                if bank_config is None:
+                    logger.warning(
+                        "Bank '%s' in run but not in config — skipping",
+                        bank_status.central_bank_name,
+                    )
+                    continue
+
+                self._run_manager.set_bank_status(
+                    run_id, bank_config.name, "in_progress"
+                )
+                logger.info("Processing bank (parallel): %s", bank_config.name)
+
+                worker_idx = i % len(self._processors)
+                future = executor.submit(
+                    self._processors[worker_idx].process_bank, bank_config
+                )
+                futures[future] = bank_config
+
+            for future in as_completed(futures):
+                bank_config = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    error_msg = f"Unhandled error processing {bank_config.name}: {exc}"
+                    logger.exception(error_msg)
+                    self._run_manager.set_bank_status(
+                        run_id, bank_config.name, "failed", error_message=error_msg
+                    )
+                    summary.errors.append(error_msg)
+                    continue
+
+                self._handle_result(run_id, bank_config, result, summary)
+
+    def _handle_result(
+        self,
+        run_id: UUID,
+        bank_config: BankConfig,
+        result: BankProcessingResult,
+        summary: RunSummary,
+    ) -> None:
+        if result.errors:
+            error_msg = "; ".join(result.errors)
+            self._run_manager.set_bank_status(
+                run_id,
+                bank_config.name,
+                "failed",
+                error_message=error_msg,
+            )
+            summary.errors.extend(result.errors)
+            logger.error("Bank %s failed: %s", bank_config.name, error_msg)
+        else:
+            self._run_manager.set_bank_status(
+                run_id,
+                bank_config.name,
+                "completed",
+                press_releases_found=result.press_releases_found,
+            )
+            summary.banks_succeeded += 1
+            logger.info(
+                "Bank %s completed: %d new, %d skipped, %d swaps",
+                bank_config.name,
+                result.press_releases_found,
+                result.skipped_duplicates,
+                result.swaps_extracted,
+            )
+
+        summary.press_releases_found += result.press_releases_found
+        summary.swaps_extracted += result.swaps_extracted

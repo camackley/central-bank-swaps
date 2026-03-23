@@ -13,8 +13,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langsmith import traceable
 
 from cbs.config.banks import BankConfig
+from cbs.llm.claude_code_model import ClaudeRateLimitError
 from cbs.pipeline.models import BankProcessingResult
-from cbs.scraper.html_extractor import HtmlExtractResult
+from cbs.scraper.html_extractor import HtmlExtractResult, extract_press_release
 from cbs.scraper.navigator import find_press_releases
 from cbs.scraper.pdf_extractor import PDFExtractResult, extract_pdf
 
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 _MIN_BODY_LENGTH = 50
 
 _ERROR_PATTERNS = ("404", "page not found", "not found", "error 404")
+
+_BOT_CHALLENGE_MARKERS = ("perfdrive.com", "shieldsquare.com", "radware")
 
 
 def _is_pdf_url(url: str) -> bool:
@@ -75,10 +78,15 @@ class DefaultBankProcessor:
         result = BankProcessingResult(bank_name=bank.name)
 
         # 1. Find press release URLs
+        # Reset browser context so each bank starts with clean cookies/session —
+        # avoids cross-bank bot-detection fingerprinting (Radware, Cloudflare).
+        self._browser.new_session()
         try:
             nav_result = find_press_releases(
                 bank, self._browser, self._llm, max_pages=self._max_pages
             )
+        except ClaudeRateLimitError:
+            raise
         except Exception as exc:
             error_msg = f"Navigation/discovery failed for {bank.name}: {exc}"
             logger.error(error_msg)
@@ -113,21 +121,35 @@ class DefaultBankProcessor:
                 title = pr.title or ""
             else:
                 try:
-                    snapshot = self._browser.navigate(pr.url)
+                    snapshot = self._browser.navigate(
+                        pr.url, timeout=bank.page_load_timeout
+                    )
                 except Exception as exc:
                     error_msg = f"Navigation error for {pr.url}: {exc}"
                     logger.error(error_msg)
                     result.errors.append(error_msg)
                     continue
 
-                extract_result = HtmlExtractResult(
-                    url=snapshot.url,
-                    title=pr.title or snapshot.title,
-                    body=snapshot.text_content,
-                    publication_date=None,
-                    language="en",
-                )
-                title = pr.title or snapshot.title
+                # Guard: skip if redirected to a bot challenge page
+                if any(m in snapshot.url.lower() for m in _BOT_CHALLENGE_MARKERS):
+                    logger.warning(
+                        "Skipping %s — bot challenge redirect to %s",
+                        pr.url,
+                        snapshot.url[:80],
+                    )
+                    redir = snapshot.url[:80]
+                    result.errors.append(
+                        f"Bot challenge for {pr.url} (redirected to {redir})"
+                    )
+                    continue
+
+                html = self._browser.get_page_html()
+                extract_result = extract_press_release(html, url=snapshot.url)
+                if pr.title:
+                    extract_result = extract_result.model_copy(
+                        update={"title": pr.title}
+                    )
+                title = extract_result.title
 
             # Guard: skip empty/short bodies
             body = extract_result.body.strip()
@@ -154,6 +176,8 @@ class DefaultBankProcessor:
                     bank_name=bank.name,
                     country=bank.country,
                 )
+            except ClaudeRateLimitError:
+                raise
             except Exception as exc:
                 error_msg = f"Processing error for {pr.url}: {exc}"
                 logger.error(error_msg)

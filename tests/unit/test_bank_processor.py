@@ -15,6 +15,21 @@ from cbs.scraper.pdf_extractor import PDFChunk, PDFExtractResult
 
 _PDF_BODY = "PDF body text " + "x" * 60
 
+_PR_BODY = (
+    "Body text of the press release about central"
+    " bank swap agreements and monetary policy."
+)
+
+_MOCK_HTML = (
+    f"<html><body><article><h1>Press Release</h1>"
+    f"<p>{_PR_BODY}</p></article></body></html>"
+)
+_EMPTY_HTML = "<html><body></body></html>"
+_NOT_FOUND_HTML = (
+    "<html><body><h1>Page not found</h1>"
+    "<p>The page you are looking for does not exist. Error 404.</p></body></html>"
+)
+
 
 def _make_bank() -> BankConfig:
     return BankConfig(
@@ -79,6 +94,7 @@ class TestProcessBankFetchesEachUrl:
         mock_find.return_value = _make_nav_result(urls)
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot()
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.return_value = PipelineResult()
 
@@ -96,6 +112,7 @@ class TestProcessBankPassesResultToOrchestrator:
         mock_find.return_value = _make_nav_result(["https://example.com/pr1"])
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot()
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.return_value = PipelineResult()
 
@@ -121,13 +138,14 @@ class TestProcessBankReturnsCorrectCounts:
         mock_find.return_value = _make_nav_result(urls)
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot()
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
 
         # 2 PRs yield swaps, 1 is not swap-related
         swap_id = uuid.uuid4()
         orchestrator.process_press_release.side_effect = [
             PipelineResult(press_release_id=uuid.uuid4(), swap_ids=[swap_id, swap_id]),
-            PipelineResult(press_release_id=uuid.uuid4(), skipped_not_swap=True),
+            PipelineResult(press_release_id=uuid.uuid4()),
             PipelineResult(press_release_id=uuid.uuid4(), swap_ids=[swap_id]),
         ]
 
@@ -143,6 +161,41 @@ class TestProcessBankReturnsCorrectCounts:
         assert not result.errors
 
 
+class TestBotChallengeSkipped:
+    @patch("cbs.pipeline.bank_processor.find_press_releases")
+    def test_bot_challenge_skipped(self, mock_find: MagicMock) -> None:
+        urls = [
+            "https://example.com/pr1",
+            "https://example.com/pr2",
+        ]
+        mock_find.return_value = _make_nav_result(urls)
+        browser = MagicMock(spec=BrowserAdapter)
+        # First PR redirects to Radware bot challenge
+        radware_snapshot = PageSnapshot(
+            url="https://validate.perfdrive.com/abc123/?ssa=xxx",
+            title="",
+            text_content="",
+        )
+        browser.navigate.side_effect = [
+            radware_snapshot,
+            _make_snapshot("https://example.com/pr2"),
+        ]
+        browser.get_page_html.return_value = _MOCK_HTML
+        orchestrator = MagicMock(spec=Orchestrator)
+        orchestrator.process_press_release.return_value = PipelineResult(
+            press_release_id=uuid.uuid4()
+        )
+
+        processor = DefaultBankProcessor(
+            orchestrator=orchestrator, browser=browser, llm=MagicMock()
+        )
+        result = processor.process_bank(_make_bank())
+
+        assert len(result.errors) == 1
+        assert "Bot challenge" in result.errors[0]
+        assert result.press_releases_found == 1
+
+
 class TestNavigationErrorCapturedContinues:
     @patch("cbs.pipeline.bank_processor.find_press_releases")
     def test_navigation_error_captured_continues(self, mock_find: MagicMock) -> None:
@@ -156,6 +209,7 @@ class TestNavigationErrorCapturedContinues:
             RuntimeError("connection lost"),
             _make_snapshot("https://example.com/pr2"),
         ]
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.return_value = PipelineResult(
             press_release_id=uuid.uuid4()
@@ -181,6 +235,7 @@ class TestOrchestratorErrorCapturedContinues:
         mock_find.return_value = _make_nav_result(urls)
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot()
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.side_effect = [
             ValueError("LLM failed"),
@@ -203,6 +258,7 @@ class TestBankNameAndCountryForwarded:
         mock_find.return_value = _make_nav_result(["https://example.com/pr1"])
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot()
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.return_value = PipelineResult()
 
@@ -306,6 +362,7 @@ class TestPdfUrlDownloadsAndExtracts:
         mock_pdf.side_effect = RuntimeError("download failed")
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot("https://example.com/pr1")
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.return_value = PipelineResult(
             press_release_id=uuid.uuid4()
@@ -331,12 +388,8 @@ class TestEmptyBodySkipped:
     def test_empty_body_skipped(self, mock_find: MagicMock) -> None:
         mock_find.return_value = _make_nav_result(["https://example.com/pr1"])
         browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = PageSnapshot(
-            url="https://example.com/pr1",
-            title="Press Release",
-            text_content="   ",  # effectively empty
-            links=[],
-        )
+        browser.navigate.return_value = _make_snapshot()
+        browser.get_page_html.return_value = _EMPTY_HTML
         orchestrator = MagicMock(spec=Orchestrator)
 
         processor = DefaultBankProcessor(
@@ -353,15 +406,8 @@ class TestErrorPageSkipped:
     def test_404_page_skipped(self, mock_find: MagicMock) -> None:
         mock_find.return_value = _make_nav_result(["https://example.com/missing"])
         browser = MagicMock(spec=BrowserAdapter)
-        browser.navigate.return_value = PageSnapshot(
-            url="https://example.com/missing",
-            title="Page not found",
-            text_content=(
-                "The page you are looking for does not"
-                " exist. Error 404. Please go back."
-            ),
-            links=[],
-        )
+        browser.navigate.return_value = _make_snapshot("https://example.com/missing")
+        browser.get_page_html.return_value = _NOT_FOUND_HTML
         orchestrator = MagicMock(spec=Orchestrator)
 
         processor = DefaultBankProcessor(
@@ -383,6 +429,7 @@ class TestListingPageUrlSkipped:
 
         browser = MagicMock(spec=BrowserAdapter)
         browser.navigate.return_value = _make_snapshot("https://example.com/pr1")
+        browser.get_page_html.return_value = _MOCK_HTML
         orchestrator = MagicMock(spec=Orchestrator)
         orchestrator.process_press_release.return_value = PipelineResult(
             press_release_id=uuid.uuid4()

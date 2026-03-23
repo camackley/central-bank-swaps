@@ -165,3 +165,48 @@ class TestIncrementalResumeSupport:
         assert "Bank A" not in processor.processed_banks
         assert "Bank B" in processor.processed_banks
         assert summary.banks_succeeded == 1
+
+
+# ---------------------------------------------------------------------------
+# test_incremental_parallel_mode
+# ---------------------------------------------------------------------------
+
+
+class TestIncrementalParallelMode:
+    def test_parallel_processes_all_banks(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_db(db)
+        proc1 = FakeBankProcessor()
+        proc2 = FakeBankProcessor()
+        banks = _make_banks_config(["Bank A", "Bank B", "Bank C"])
+        orch = IncrementalOrchestrator(db, RunManager(db), [proc1, proc2], banks)
+
+        summary = orch.run()
+
+        all_processed = set(proc1.processed_banks + proc2.processed_banks)
+        assert all_processed == {"Bank A", "Bank B", "Bank C"}
+        assert summary.banks_succeeded == 3
+
+    def test_parallel_aggregates_counts(self, db: duckdb.DuckDBPyConnection) -> None:
+        init_db(db)
+        proc1 = FakeBankProcessor(default_press_releases=4, default_swaps=2)
+        proc2 = FakeBankProcessor(default_press_releases=4, default_swaps=2)
+        banks = _make_banks_config(["Bank A", "Bank B"])
+        orch = IncrementalOrchestrator(db, RunManager(db), [proc1, proc2], banks)
+
+        summary = orch.run()
+
+        assert summary.press_releases_found == 8
+        assert summary.swaps_extracted == 4
+
+    def test_single_processor_list_uses_sequential(
+        self, db: duckdb.DuckDBPyConnection
+    ) -> None:
+        init_db(db)
+        processor = FakeBankProcessor()
+        banks = _make_banks_config(["Bank A"])
+        orch = IncrementalOrchestrator(db, RunManager(db), [processor], banks)
+
+        summary = orch.run()
+
+        assert summary.banks_succeeded == 1
+        assert processor.processed_banks == ["Bank A"]

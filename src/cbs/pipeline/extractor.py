@@ -9,11 +9,12 @@ acceptable.
 
 from __future__ import annotations
 
-from decimal import Decimal
+import re
+from decimal import Decimal, InvalidOperation
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Pydantic models — these double as the LangChain structured-output schema
@@ -39,8 +40,42 @@ class SwapDirection(BaseModel):
     )
     swap_amount: Decimal | None = Field(
         default=None,
-        description="Notional amount in this currency. NULL if not stated.",
+        description=(
+            "Notional amount as a pure number (e.g. 20000000000). NULL if not stated."
+        ),
     )
+
+    @field_validator("swap_amount", mode="before")
+    @classmethod
+    def parse_amount(cls, v: object) -> Decimal | None:
+        """Accept numeric strings or formatted LLM output like 'A$20 billion'."""
+        if v is None:
+            return None
+        if isinstance(v, Decimal):
+            return v
+        if isinstance(v, (int, float)):
+            return Decimal(str(v))
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            try:
+                return Decimal(v)
+            except InvalidOperation:
+                pass
+            match = re.search(r"[\d,]+(?:\.\d+)?", v)
+            if not match:
+                return None
+            number = Decimal(match.group().replace(",", ""))
+            lower = v.lower()
+            if "trillion" in lower:
+                number *= Decimal("1000000000000")
+            elif "billion" in lower:
+                number *= Decimal("1000000000")
+            elif "million" in lower:
+                number *= Decimal("1000000")
+            return number
+        return None
 
 
 class SwapRecord(BaseModel):
@@ -146,6 +181,8 @@ Rules:
    each swap's data.
 8. If a field cannot be determined from the text, set it to null. \
    Do NOT hallucinate values.
+9. For swap_amount, return a pure number (e.g. 20000000000), not a \
+   formatted string (NOT "A$20 billion" or "JPY 1.6 trillion").
 """
 
 

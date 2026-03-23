@@ -1,26 +1,25 @@
-"""PinchTab browser adapter — thin wrapper around PinchTab's HTTP API.
+"""Playwright browser adapter — direct JS-rendering browser automation.
 
-Provides two layers:
-- ``BrowserClient``: low-level HTTP adapter (Slice 1.9) with ``navigate()``
-- ``BrowserAdapter``: higher-level adapter (Slice 1.10) adding ``click()``
-  and ``get_snapshot()`` for the agentic navigator
-
-Targets PinchTab standalone mode (v0.7+) where Chrome is managed by the
-server.  Uses flat top-level endpoints: ``/navigate``, ``/text``,
-``/snapshot``, ``/action``, ``/evaluate``.
+Replaces the former PinchTab HTTP adapter with a self-contained Playwright
+backend.  Uses ``networkidle`` wait strategy by default so that React/JS
+content is fully rendered before snapshotting.
 """
 
 from __future__ import annotations
 
-import json
+import contextlib
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-import httpx
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -28,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 class BrowserError(Exception):
-    """Base exception for all PinchTab browser errors."""
+    """Base exception for all browser errors."""
 
 
 class BrowserConnectionError(BrowserError):
-    """Raised when PinchTab server is unreachable."""
+    """Raised when the browser cannot be launched."""
 
 
 class BrowserTimeoutError(BrowserError):
@@ -40,16 +39,16 @@ class BrowserTimeoutError(BrowserError):
 
 
 class BrowserNavigationError(BrowserError):
-    """Raised when navigation fails (non-2xx from PinchTab)."""
+    """Raised when navigation fails."""
 
 
 # ---------------------------------------------------------------------------
-# Public data classes — navigator's view of a browser page
+# Public data classes
 # ---------------------------------------------------------------------------
 
 
 class PageContent(BaseModel):
-    """Content retrieved from a navigated page (low-level)."""
+    """Legacy data class kept for backward compatibility."""
 
     url: str
     title: str
@@ -59,16 +58,20 @@ class PageContent(BaseModel):
 
 @dataclass(frozen=True)
 class PageLink:
-    """A link discovered on a page via the accessibility snapshot."""
+    """A link discovered on a page.
+
+    ``element_ref`` is the absolute URL of the link — used as the argument
+    to ``click()`` for multi-step navigation.
+    """
 
     text: str
     url: str
-    element_ref: str  # PinchTab element reference (e.g., "e0", "e1")
+    element_ref: str
 
 
 @dataclass(frozen=True)
 class PageSnapshot:
-    """Snapshot of the current browser page state (high-level)."""
+    """Snapshot of the current browser page state."""
 
     url: str
     title: str
@@ -77,177 +80,81 @@ class PageSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# BrowserClient — low-level PinchTab HTTP adapter (Slice 1.9)
+# PlaywrightBrowserAdapter
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BASE_URL = "http://localhost:9867"
 _DEFAULT_TIMEOUT = 30
-_HTTPX_BUFFER_SECONDS = 10
+_MAX_LINKS = 500  # guard against link-farm pages
 
-# JS expression that extracts all link texts and hrefs in DOM order.
-_EXTRACT_LINKS_JS = (
-    "JSON.stringify(Array.from(document.querySelectorAll('a[href]'))"
-    ".map(a=>({t:a.textContent.trim().slice(0,200),h:a.href})))"
-)
+# Extracts all unique absolute <a href> links from the fully-rendered DOM.
+_EXTRACT_LINKS_JS = """
+() => {
+    const seen = new Set();
+    const results = [];
+    for (const a of document.querySelectorAll('a[href]')) {
+        const href = a.href;
+        if (href && href.startsWith('http') && !seen.has(href)) {
+            seen.add(href);
+            results.push({
+                text: a.textContent.trim().slice(0, 200),
+                href: href,
+            });
+        }
+    }
+    return results;
+}
+"""
+
+WaitStrategy = Literal["networkidle", "domcontentloaded", "load"]
 
 
-class BrowserClient:
-    """Thin adapter around PinchTab's standalone HTTP API.
+_BOT_CHALLENGE_MARKERS = ("perfdrive.com", "shieldsquare.com", "radware")
 
-    In standalone mode PinchTab manages Chrome directly — no instance
-    lifecycle is needed.  Use as a context manager for consistency::
 
-        with BrowserClient() as browser:
-            page = browser.navigate("https://example.com", timeout=30)
-            print(page.text)
+class PlaywrightBrowserAdapter:
+    """Browser adapter backed by Playwright.
+
+    Uses ``networkidle`` wait strategy by default so that React/JS-rendered
+    content is present in the DOM before link extraction.
+
+    Use as a context manager::
+
+        with PlaywrightBrowserAdapter() as browser:
+            snapshot = browser.navigate("https://example.com")
+            html = browser.get_page_html()
+
+    Args:
+        headless: Run Chromium in headless mode (default True).
+        profile_dir: Path to a Chromium user-data directory for persistent
+            cookies and session storage.  When set, the adapter uses
+            ``launch_persistent_context()`` so that bot-manager session
+            cookies (Radware, Cloudflare) survive across runs.  Defaults
+            to the ``CBS_BROWSER_PROFILE`` environment variable, or None.
+        _page: Inject a Playwright ``Page`` for unit testing.  When set,
+            the adapter skips Playwright startup/shutdown.
     """
 
     def __init__(
         self,
-        base_url: str = _DEFAULT_BASE_URL,
         headless: bool = True,
-        _http_client: httpx.Client | None = None,
+        profile_dir: str | None = None,
+        _page: Page | None = None,
     ) -> None:
-        self._base_url = base_url
         self._headless = headless
-        self._http_client = _http_client or httpx.Client()
-        self._started = False
+        self._profile_dir: str | None = profile_dir or os.environ.get(
+            "CBS_BROWSER_PROFILE"
+        )
+        self._page: Page | None = _page
+        self._owned: bool = _page is None
+        self._current_url: str = ""
+        self._current_title: str = ""
+        self._pw_ctx: Any = None
+        self._browser_instance: Any = None  # None when using persistent context
+        self._context: Any = None  # BrowserContext — set in both modes
 
-    def __enter__(self) -> BrowserClient:
-        self.start()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> None:
-        self.stop()
-
-    # -- Instance lifecycle -------------------------------------------------
-
-    def start(self) -> None:
-        """Verify PinchTab is reachable.
-
-        Raises:
-            BrowserConnectionError: If PinchTab server is unreachable.
-        """
-        try:
-            resp = self._http_client.get(f"{self._base_url}/health")
-            resp.raise_for_status()
-            self._started = True
-        except httpx.ConnectError as exc:
-            msg = f"Cannot connect to PinchTab at {self._base_url}"
-            raise BrowserConnectionError(msg) from exc
-        except httpx.HTTPStatusError as exc:
-            msg = f"PinchTab health check failed: {exc.response.status_code}"
-            raise BrowserError(msg) from exc
-
-    def stop(self) -> None:
-        """No-op — PinchTab manages Chrome in standalone mode."""
-        self._started = False
-
-    # -- Navigation ---------------------------------------------------------
-
-    def navigate(self, url: str, timeout: int = _DEFAULT_TIMEOUT) -> PageContent:
-        """Navigate to *url*, wait for render, and return page content.
-
-        Args:
-            url: The URL to navigate to.
-            timeout: Maximum seconds to wait for page load.
-
-        Returns:
-            PageContent with url, title, text, and snapshot.
-
-        Raises:
-            BrowserTimeoutError: If page load exceeds *timeout*.
-            BrowserNavigationError: If PinchTab returns a non-2xx status.
-            BrowserConnectionError: If PinchTab server is unreachable.
-            BrowserError: If the client has not been started.
-        """
-        if not self._started:
-            msg = (
-                "Browser instance not started — call start() or use as context manager"
-            )
-            raise BrowserError(msg)
-
-        try:
-            # 1. Navigate (PinchTab waits for render completion)
-            resp = self._http_client.post(
-                f"{self._base_url}/navigate",
-                json={"url": url, "timeout": timeout, "blockImages": True},
-                timeout=timeout + _HTTPX_BUFFER_SECONDS,
-            )
-            resp.raise_for_status()
-            nav_data = resp.json()
-
-            # 2. Get text content
-            text_resp = self._http_client.get(
-                f"{self._base_url}/text",
-            )
-            text_resp.raise_for_status()
-            text_data = text_resp.json()
-            text = text_data.get("text", "")
-
-            # 3. Get accessibility snapshot
-            snap_resp = self._http_client.get(
-                f"{self._base_url}/snapshot",
-            )
-            snap_resp.raise_for_status()
-            snapshot = snap_resp.text
-
-            return PageContent(
-                url=nav_data.get("url", url),
-                title=nav_data.get("title", ""),
-                text=text,
-                snapshot=snapshot,
-            )
-
-        except httpx.ConnectError as exc:
-            msg = f"Lost connection to PinchTab at {self._base_url}"
-            raise BrowserConnectionError(msg) from exc
-        except httpx.TimeoutException as exc:
-            msg = f"Page load timed out after {timeout}s for {url}"
-            raise BrowserTimeoutError(msg) from exc
-        except httpx.HTTPStatusError as exc:
-            msg = (
-                f"Navigation failed for {url}: "
-                f"PinchTab returned {exc.response.status_code}"
-            )
-            raise BrowserNavigationError(msg) from exc
-
-
-# ---------------------------------------------------------------------------
-# BrowserAdapter — high-level adapter for agentic navigation (Slice 1.10)
-# ---------------------------------------------------------------------------
-
-
-class BrowserAdapter:
-    """Higher-level adapter for the agentic navigator.
-
-    Adds ``click()`` and ``get_snapshot()`` on top of basic navigation.
-    Uses PinchTab standalone flat API::
-
-        with BrowserAdapter() as browser:
-            page = browser.navigate("https://example.com")
-            page2 = browser.click("e3")
-    """
-
-    def __init__(
-        self,
-        base_url: str = _DEFAULT_BASE_URL,
-        headless: bool = True,
-        _http_client: httpx.Client | None = None,
-    ) -> None:
-        self._base_url = base_url
-        self._headless = headless
-        self._http_client = _http_client or httpx.Client()
-        self._active = False
-        self._current_url = ""
-        self._current_title = ""
-
-    def __enter__(self) -> BrowserAdapter:
+    def __enter__(self) -> PlaywrightBrowserAdapter:
+        if self._owned:
+            self._start()
         return self
 
     def __exit__(
@@ -260,189 +167,280 @@ class BrowserAdapter:
 
     # -- Internal helpers ---------------------------------------------------
 
-    def _ensure_ready(self) -> None:
-        """Verify PinchTab is reachable on first use."""
-        if self._active:
-            return
-        try:
-            resp = self._http_client.get(f"{self._base_url}/health")
-            resp.raise_for_status()
-            self._active = True
-        except httpx.ConnectError as exc:
-            msg = f"Cannot connect to PinchTab at {self._base_url}"
-            raise BrowserConnectionError(msg) from exc
-        except httpx.HTTPStatusError as exc:
-            msg = f"PinchTab health check failed: {exc.response.status_code}"
-            raise BrowserError(msg) from exc
+    def _start(self) -> None:
+        """Launch Playwright + Chromium and open a new page.
 
-    def _require_navigated(self) -> None:
-        """Ensure we have navigated to a page."""
-        if not self._current_url:
-            msg = "No active tab — call navigate() first"
-            raise BrowserError(msg)
-
-    def _fetch_snapshot(self) -> PageSnapshot:
-        """Get text + accessibility snapshot for the current page."""
-        self._require_navigated()
-        try:
-            text_resp = self._http_client.get(f"{self._base_url}/text")
-            text_resp.raise_for_status()
-            text_data = text_resp.json()
-            text = text_data.get("text", "")
-            # Update current URL/title from text response (may have changed
-            # after click-induced navigation).
-            self._current_url = text_data.get("url", self._current_url)
-            self._current_title = text_data.get("title", self._current_title)
-
-            snap_resp = self._http_client.get(f"{self._base_url}/snapshot")
-            snap_resp.raise_for_status()
-            snap_data = snap_resp.json()
-
-            links = self._extract_links(snap_data)
-
-            return PageSnapshot(
-                url=self._current_url,
-                title=self._current_title,
-                text_content=text,
-                links=links,
-            )
-        except httpx.ConnectError as exc:
-            msg = f"Lost connection to PinchTab at {self._base_url}"
-            raise BrowserConnectionError(msg) from exc
-        except httpx.HTTPStatusError as exc:
-            msg = f"Snapshot failed: PinchTab returned {exc.response.status_code}"
-            raise BrowserNavigationError(msg) from exc
-
-    def _extract_links(self, snap_data: dict[str, Any]) -> list[PageLink]:
-        """Extract links by combining snapshot nodes with JS-evaluated URLs.
-
-        The snapshot gives us link nodes (role="link") with their element
-        refs and accessible names, but no hrefs.  We run a JS expression
-        via ``/evaluate`` to get all ``<a>`` hrefs in DOM order, then match
-        them to snapshot link nodes by text.
+        Applies anti-detection measures so that sites with bot protection
+        (Radware, Cloudflare, etc.) do not block headless Chromium:
+        - ``--disable-blink-features=AutomationControlled`` removes the
+          ``window.navigator.webdriver`` property that marks automated browsers.
+        - A realistic Windows/Chrome user agent replaces the ``HeadlessChrome``
+          string that triggers most bot-detection heuristics.
+        - ``navigator.webdriver`` is deleted via an init script as a second layer.
         """
-        nodes = snap_data.get("nodes", [])
-        link_nodes = [n for n in nodes if n.get("role") == "link"]
-        if not link_nodes:
+        _launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        _context_kwargs: dict[str, Any] = {
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+        }
+        try:
+            self._pw_ctx = sync_playwright().start()
+            if self._profile_dir:
+                # Persistent context — cookies/session survive across runs.
+                # launch_persistent_context returns a BrowserContext directly.
+                os.makedirs(self._profile_dir, exist_ok=True)
+                self._context = self._pw_ctx.chromium.launch_persistent_context(
+                    self._profile_dir,
+                    headless=self._headless,
+                    args=_launch_args,
+                    **_context_kwargs,
+                )
+                # No separate browser instance when using persistent context.
+                self._browser_instance = None
+            else:
+                self._browser_instance = self._pw_ctx.chromium.launch(
+                    headless=self._headless,
+                    args=_launch_args,
+                )
+                # Create a browser context with a realistic user agent and viewport.
+                self._context = self._browser_instance.new_context(**_context_kwargs)
+            self._page = self._context.new_page()
+            # Remove the webdriver property that signals browser automation.
+            self._page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            # Block images, fonts, and media to speed up page loads.
+            self._page.route(
+                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webm}",
+                lambda route: route.abort(),
+            )
+        except PlaywrightError as exc:
+            raise BrowserConnectionError(f"Failed to launch Chromium: {exc}") from exc
+
+    def _require_page(self) -> Page:
+        if self._page is None:
+            raise BrowserError("Browser not started — use as context manager")
+        return self._page
+
+    def _open_fresh_page(self) -> None:
+        """Open a fresh page, clearing cross-bank session state.
+
+        - Non-persistent mode: closes the current context and creates a new one
+          (clears all cookies/session for bot-detection isolation per bank).
+        - Persistent mode: opens a new page in the same context (cookies are
+          preserved intentionally across banks to maintain Radware trust score).
+        """
+        if self._context is None:
+            raise BrowserError("Browser not started — use as context manager")
+        if self._page is not None:
+            with contextlib.suppress(PlaywrightError):
+                self._page.close()
+            self._page = None
+
+        if self._browser_instance is not None:
+            # Non-persistent: create a fresh context (clears cookies)
+            with contextlib.suppress(PlaywrightError):
+                self._context.close()
+            self._context = self._browser_instance.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            logger.debug("Opened fresh browser context (cleared cookies/session)")
+        # else: persistent context — reuse same context, cookies intentionally kept
+
+        self._page = self._context.new_page()
+        self._page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        self._page.route(
+            "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webm}",
+            lambda route: route.abort(),
+        )
+        self._current_url = ""
+        self._current_title = ""
+
+    def _extract_links(self, page: Page) -> list[PageLink]:
+        """Extract all unique absolute links from the rendered DOM."""
+        try:
+            raw: list[dict[str, str]] = page.evaluate(_EXTRACT_LINKS_JS)
+            links = []
+            for item in raw[:_MAX_LINKS]:
+                url = item.get("href", "")
+                text = item.get("text", "")
+                if url:
+                    links.append(PageLink(text=text, url=url, element_ref=url))
+            return links
+        except PlaywrightError as exc:
+            logger.warning("Failed to extract links via JS: %s", exc)
             return []
 
-        # Get link URLs via JS evaluation
+    def _build_snapshot(self, page: Page) -> PageSnapshot:
+        """Build a PageSnapshot from the current page state."""
+        self._current_url = page.url
+        self._current_title = page.title()
         try:
-            eval_resp = self._http_client.post(
-                f"{self._base_url}/evaluate",
-                json={"expression": _EXTRACT_LINKS_JS},
-            )
-            eval_resp.raise_for_status()
-            eval_data = eval_resp.json()
-            dom_links: list[dict[str, str]] = json.loads(eval_data.get("result", "[]"))
-        except (httpx.HTTPError, json.JSONDecodeError, KeyError):
-            logger.warning("Failed to extract link URLs via evaluate, using refs only")
-            return [
-                PageLink(
-                    text=n.get("name", ""),
-                    url="",
-                    element_ref=n.get("ref", ""),
-                )
-                for n in link_nodes
-            ]
-
-        # Build a lookup: text → list of hrefs (for duplicate text handling)
-        text_to_hrefs: dict[str, list[str]] = {}
-        for dl in dom_links:
-            t = dl.get("t", "")
-            h = dl.get("h", "")
-            if t not in text_to_hrefs:
-                text_to_hrefs[t] = []
-            text_to_hrefs[t].append(h)
-
-        links: list[PageLink] = []
-        for node in link_nodes:
-            name = node.get("name", "")
-            ref = node.get("ref", "")
-            href = ""
-            # Try exact match first
-            if name in text_to_hrefs and text_to_hrefs[name]:
-                href = text_to_hrefs[name].pop(0)
-            else:
-                # Try substring match (accessible name may be truncated)
-                for t, hrefs in text_to_hrefs.items():
-                    if hrefs and (name in t or t in name):
-                        href = hrefs.pop(0)
-                        break
-            if href:
-                links.append(PageLink(text=name, url=href, element_ref=ref))
-
-        return links
+            text: str = page.evaluate("() => document.body.innerText") or ""
+        except PlaywrightError:
+            text = ""
+        links = self._extract_links(page)
+        return PageSnapshot(
+            url=self._current_url,
+            title=self._current_title,
+            text_content=text,
+            links=links,
+        )
 
     # -- Public API ---------------------------------------------------------
 
-    def navigate(self, url: str, timeout: int = 30) -> PageSnapshot:
-        """Navigate to *url* and return the resulting page snapshot.
+    def navigate(
+        self,
+        url: str,
+        timeout: int = _DEFAULT_TIMEOUT,
+        wait_strategy: WaitStrategy = "networkidle",
+        wait_for_selector: str | None = None,
+    ) -> PageSnapshot:
+        """Navigate to *url* and wait for the page to finish rendering.
+
+        Args:
+            url: The URL to navigate to.
+            timeout: Maximum seconds to wait for page load.
+            wait_strategy: Playwright load-state condition.
+                ``"networkidle"`` (default) waits until no network requests
+                are in flight for 500 ms — ensures React/fetch content loads.
+            wait_for_selector: Optional CSS selector to wait for after the
+                load state is reached.  Useful for SPAs that render content
+                asynchronously (e.g. ``"article"`` for Bank of England).
 
         Raises:
-            BrowserTimeoutError: If page load exceeds *timeout*.
-            BrowserNavigationError: If PinchTab returns a non-2xx status.
-            BrowserConnectionError: If PinchTab server is unreachable.
+            BrowserTimeoutError: If the page load exceeds *timeout* seconds.
+            BrowserNavigationError: If Playwright reports a navigation error.
+            BrowserError: If the browser has not been started.
         """
+        page = self._require_page()
         try:
-            self._ensure_ready()
-
-            resp = self._http_client.post(
-                f"{self._base_url}/navigate",
-                json={"url": url, "timeout": timeout, "blockImages": True},
-                timeout=timeout + _HTTPX_BUFFER_SECONDS,
+            page.goto(url, wait_until=wait_strategy, timeout=timeout * 1000)
+            if wait_for_selector:
+                page.wait_for_selector(wait_for_selector, timeout=timeout * 1000)
+        except PlaywrightTimeoutError as exc:
+            raise BrowserTimeoutError(
+                f"Page load timed out after {timeout}s for {url}"
+            ) from exc
+        except PlaywrightError as exc:
+            raise BrowserNavigationError(f"Navigation failed for {url}: {exc}") from exc
+        snapshot = self._build_snapshot(page)
+        if any(m in snapshot.url.lower() for m in _BOT_CHALLENGE_MARKERS):
+            logger.warning(
+                "Bot challenge detected navigating to %s — landed on %s. "
+                "Set CBS_BROWSER_PROFILE to a directory path for persistent "
+                "cookies across runs.",
+                url,
+                snapshot.url[:120],
             )
-            resp.raise_for_status()
-            nav_data = resp.json()
-            self._current_url = nav_data.get("url", url)
-            self._current_title = nav_data.get("title", "")
+        return snapshot
 
-            return self._fetch_snapshot()
+    def click(self, element_ref: str, timeout: int = _DEFAULT_TIMEOUT) -> PageSnapshot:
+        """Navigate to *element_ref* (absolute URL) and return the snapshot.
 
-        except httpx.ConnectError as exc:
-            msg = f"Cannot connect to PinchTab at {self._base_url}"
-            raise BrowserConnectionError(msg) from exc
-        except httpx.TimeoutException as exc:
-            msg = f"Page load timed out after {timeout}s for {url}"
-            raise BrowserTimeoutError(msg) from exc
-        except httpx.HTTPStatusError as exc:
-            msg = (
-                f"Navigation failed for {url}: "
-                f"PinchTab returned {exc.response.status_code}"
-            )
-            raise BrowserNavigationError(msg) from exc
-
-    def click(self, element_ref: str, timeout: int = 30) -> PageSnapshot:
-        """Click an element by its PinchTab ref and return the resulting page.
+        In the Playwright adapter, ``element_ref`` is the absolute URL of the
+        link to follow.  The browser navigates directly to it rather than
+        clicking a DOM element by ref.
 
         Raises:
-            BrowserError: If the click or subsequent page load fails.
+            BrowserError: If no page has been navigated yet.
+            BrowserTimeoutError: If the navigation exceeds *timeout* seconds.
+            BrowserNavigationError: If the navigation fails.
         """
-        self._require_navigated()
+        page = self._require_page()
+        if not self._current_url:
+            raise BrowserError("No active page — call navigate() first")
         try:
-            resp = self._http_client.post(
-                f"{self._base_url}/action",
-                json={"kind": "click", "ref": element_ref},
-                timeout=timeout + _HTTPX_BUFFER_SECONDS,
-            )
-            resp.raise_for_status()
-            return self._fetch_snapshot()
-        except httpx.ConnectError as exc:
-            msg = f"Lost connection to PinchTab at {self._base_url}"
-            raise BrowserConnectionError(msg) from exc
-        except httpx.TimeoutException as exc:
-            msg = f"Click timed out after {timeout}s"
-            raise BrowserTimeoutError(msg) from exc
-        except httpx.HTTPStatusError as exc:
-            msg = f"Click failed: PinchTab returned {exc.response.status_code}"
-            raise BrowserNavigationError(msg) from exc
+            page.goto(element_ref, wait_until="networkidle", timeout=timeout * 1000)
+        except PlaywrightTimeoutError as exc:
+            raise BrowserTimeoutError(f"Navigation timed out after {timeout}s") from exc
+        except PlaywrightError as exc:
+            raise BrowserNavigationError(
+                f"Navigation failed for {element_ref}: {exc}"
+            ) from exc
+        return self._build_snapshot(page)
 
     def get_snapshot(self) -> PageSnapshot:
-        """Get a snapshot of the current page without navigating."""
-        return self._fetch_snapshot()
+        """Return a snapshot of the current page without navigating."""
+        page = self._require_page()
+        if not self._current_url:
+            raise BrowserError("No active page — call navigate() first")
+        return self._build_snapshot(page)
+
+    def get_page_html(self) -> str:
+        """Return the full rendered DOM HTML (after JS execution).
+
+        Use this when you want Claude to read the complete page content
+        and extract press release URLs directly — more reliable than
+        accessibility-tree link extraction for complex React/SPA pages.
+
+        Raises:
+            BrowserError: If no page has been navigated yet.
+            BrowserNavigationError: If the HTML cannot be retrieved.
+        """
+        page = self._require_page()
+        if not self._current_url:
+            raise BrowserError("No active page — call navigate() first")
+        try:
+            return page.content()
+        except PlaywrightError as exc:
+            raise BrowserNavigationError(f"Failed to get page HTML: {exc}") from exc
+
+    def new_session(self) -> None:
+        """Reset browser state for a new bank visit (clears cookies/session).
+
+        Closes the current browser context and opens a fresh one on the same
+        running Chromium instance.  Call this between banks to avoid cross-bank
+        session fingerprinting by bot-detection systems (Radware, Cloudflare).
+
+        No-op when the adapter was created with an injected ``_page`` (test mode).
+        """
+        if not self._owned:
+            return
+        self._open_fresh_page()
 
     def close_session(self) -> None:
-        """Reset adapter state.  Safe to call multiple times."""
-        self._active = False
+        """Shut down Playwright and release all browser resources."""
+        if not self._owned:
+            self._current_url = ""
+            self._current_title = ""
+            return
+        if self._page is not None:
+            with contextlib.suppress(PlaywrightError):
+                self._page.close()
+            self._page = None
+        if self._context is not None:
+            with contextlib.suppress(PlaywrightError):
+                self._context.close()
+            self._context = None
+        if self._browser_instance is not None:
+            with contextlib.suppress(PlaywrightError):
+                self._browser_instance.close()
+            self._browser_instance = None
+        if self._pw_ctx is not None:
+            with contextlib.suppress(PlaywrightError):
+                self._pw_ctx.stop()
+            self._pw_ctx = None
         self._current_url = ""
         self._current_title = ""
+
+
+# Backward-compatible alias — the rest of the codebase imports BrowserAdapter.
+BrowserAdapter = PlaywrightBrowserAdapter

@@ -1,5 +1,7 @@
 """Tests for run manager & bank status tracking (Slice 1.3)."""
 
+import uuid
+
 import duckdb
 
 from cbs.db.run_manager import RunManager, ScrapingRun
@@ -51,6 +53,27 @@ class TestCreateScrapingRun:
         assert len(rows) == 2
         assert rows[0] == ("ECB", "pending")
         assert rows[1] == ("Federal Reserve", "pending")
+
+    def test_create_run_with_explicit_run_id(
+        self, db: duckdb.DuckDBPyConnection
+    ) -> None:
+        """Pre-generated run_id is preserved in the DB."""
+        init_db(db)
+        mgr = RunManager(db)
+        explicit_id = uuid.uuid4()
+
+        run = mgr.create_run(
+            run_type="backfill",
+            bank_names=["Federal Reserve"],
+            run_id=explicit_id,
+        )
+
+        assert run.id == explicit_id
+        row = db.execute(
+            "SELECT id FROM scraping_runs WHERE id = ?", [str(explicit_id)]
+        ).fetchone()
+        assert row is not None
+        assert row[0] == explicit_id
 
 
 class TestBankStatusTransitions:
